@@ -336,7 +336,10 @@ class ReceiptIntegrityTests(unittest.TestCase):
                 "import unittest\n\n"
                 "class EnvironmentTest(unittest.TestCase):\n"
                 "    def test_secret_is_absent(self):\n"
-                "        self.assertNotIn('BEN_TEST_SECRET', os.environ)\n",
+                "        self.assertNotIn('BEN_TEST_SECRET', os.environ)\n\n"
+                "    def test_local_path_is_redacted(self):\n"
+                "        local_path = os.path.join(os.environ['TEMP'], 'private')\n"
+                "        self.skipTest(repr(local_path))\n",
                 encoding="utf-8",
             )
             (root / "tests" / "test_data_registry.py").write_text(
@@ -372,6 +375,12 @@ class ReceiptIntegrityTests(unittest.TestCase):
             self.assertEqual(receipt["full_provenance_replay"]["status"], "PASS")
 
             log = root / receipt["normalized_output_path"]
+            log_text = log.read_text(encoding="utf-8")
+            for key in ("TEMP", "TMP"):
+                if value := os.environ.get(key):
+                    self.assertNotIn(value, log_text)
+                    self.assertNotIn(repr(value)[1:-1], log_text)
+            self.assertIn("<REDACTED_LOCAL_PATH>", log_text)
             log.write_bytes(log.read_bytes() + b"tampered\n")
             with self.assertRaises(ValueError):
                 verified_hashed_object(receipt_path, "receipt_sha256")

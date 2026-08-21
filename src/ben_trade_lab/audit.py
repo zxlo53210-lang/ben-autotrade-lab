@@ -30,6 +30,41 @@ SAFE_TEST_ENVIRONMENT_KEYS = (
 )
 
 
+def _redact_local_paths(
+    output: str, root_path: Path, environment: dict[str, str]
+) -> str:
+    """Remove host-specific repository and temporary-directory prefixes."""
+
+    path_values = {str(root_path)}
+    path_values.update(
+        value
+        for key in ("TEMP", "TMP")
+        if (value := environment.get(key))
+    )
+    variants: set[str] = set()
+    for value in path_values:
+        normalized = os.path.normpath(value)
+        variants.update({value, normalized, normalized.replace("\\", "/")})
+        escaped = normalized
+        for _ in range(3):
+            escaped = escaped.replace("\\", "\\\\")
+            variants.add(escaped)
+    redacted = output
+    for variant in sorted(variants, key=len, reverse=True):
+        if variant:
+            redacted = redacted.replace(variant, "<REDACTED_LOCAL_PATH>")
+    return redacted
+
+
+def _normalize_test_output(
+    output: str, root_path: Path, environment: dict[str, str]
+) -> str:
+    without_timing = re.sub(
+        r"Ran (\d+) tests? in [0-9.]+s", r"Ran \1 tests", output
+    )
+    return _redact_local_paths(without_timing, root_path, environment)
+
+
 def _bound_fields(selection: dict[str, Any]) -> dict[str, Any]:
     return {
         "experiment_id": selection["experiment_id"],
@@ -98,7 +133,7 @@ def create_test_receipt(root: str | Path, selection_path: str | Path, config: La
         check=False,
     )
     combined = completed.stdout + completed.stderr
-    normalized = re.sub(r"Ran (\d+) tests? in [0-9.]+s", r"Ran \1 tests", combined)
+    normalized = _normalize_test_output(combined, root_path, environment)
     source_after = source_tree_sha256(root_path)
     source_unchanged = source_after == source_before == selection["source_tree_sha256"]
     if not source_unchanged:
