@@ -20,16 +20,35 @@ Exchange outages also produce missing hourly rows. The raw and normalized
 datasets remain untouched and every gap is enumerated in the manifest. For the
 simulator only, the pre-registered `CARRY_FORWARD_NO_FILL` policy inserts an
 in-memory synthetic flat bar at the last official close, marks it synthetic,
-forbids fills and signal changes on it, and resumes trading only on an official
-bar. This preserves wall-clock windows without pretending an outage price was
-tradable.
+forbids fills, signal changes, pending-intent changes, and rolling-indicator
+aging on it, and resumes strategy-state updates only on an official bar with
+positive volume and positive trade count. UTC timestamps still advance for
+elapsed-time accounting, but strategy lookbacks contain eligible observations
+only; an outage price is never treated as tradable evidence. Official
+zero-volume or zero-trade bars use the same frozen-state/no-fill rule while
+remaining identified as official source rows.
 
-Every manifest records the request boundary, first and last open time, row
-count, raw batch hashes, normalized CSV SHA-256, and retrieval time. It is not a
-digital signature. Verification replays each raw batch, checks its metadata,
-reconstructs normalized bytes, validates manifest fields, and rejects paths
-outside the repository data directories. Market data is mutable upstream, so
-byte hashes are part of the experiment identity.
+The full-source manifest records the request boundary, first and last open time,
+row count, raw batch hashes, normalized CSV SHA-256, and retrieval time. It is
+not a digital signature. Full verification replays each raw batch, checks its
+metadata, reconstructs normalized bytes, validates manifest fields, and rejects
+paths outside the repository data directories. Market data is mutable upstream,
+so byte hashes are part of the experiment identity.
+
+The deterministic partition step writes exact-schema v1.2 PRE and LOCKED
+manifests. Their descriptors bind the common parent/config/registry/lockbox/data
+metadata in both directions, while PRE additionally binds the exact LOCKED
+manifest path and file SHA-256. Ordinary candidate selection first accepts only
+PRE metadata, then reads only PRE prices. FULL and LOCKED inputs fail before any
+price-bearing normalized or raw file is opened.
+
+Full-source replay is an explicitly gated, data-only operation. It reloads the
+FULL source and proves that the exact selection-bound PRE and LOCKED bytes are
+canonical parent slices. It cannot call strategy/metric code or return price
+rows to the researcher/model. Its allowed external evidence is limited to
+hashes, counts, and PASS/FAIL. The default test suite does not enable this
+replay; ordinary LOCKED access remains blocked until the external anchor and
+local one-shot open state are durably committed.
 
 Downloaded market data is intentionally excluded from Git. The public
 repository tracks one price-free provenance-root manifest containing request

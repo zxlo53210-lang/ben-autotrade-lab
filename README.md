@@ -23,6 +23,9 @@ does not guarantee future returns.
 - Bars: 1 hour, UTC, completed bars only
 - Position: long or cash; no leverage, shorting, or borrowing
 - Signal/fill rule: close of bar `t` -> earliest fill at open of `t+1`
+- State/fill eligibility: official, non-synthetic bars with positive volume and
+  positive trade count; all other hours advance UTC time but freeze strategy
+  and pending-intent state
 - Data host: Binance's unauthenticated market-data-only endpoint
 - Modes: `BACKTEST`, `PAPER`; live execution is structurally unavailable
 
@@ -53,6 +56,15 @@ $env:PYTHONPATH = "$PWD\src"
 & .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
+The ordinary suite deliberately skips the local full-snapshot provenance
+replay. It is safe for routine development and must not be treated as authority
+to open the holdout. The source-bound `audit tests` command below launches an
+isolated, credential-free replay of the exact PRE/LOCKED manifest pair bound by
+the frozen selection. It emits only hashes, counters, and test status. Its
+receipt authorizes review/finalization only when
+`full_provenance_replay.status` is exactly `PASS`; `SKIPPED`, `ABSENT`,
+`AMBIGUOUS`, or `FAIL` remains blocked.
+
 Linux or WSL uses the same dependency-free core:
 
 ```bash
@@ -70,8 +82,11 @@ Fetch and verify one immutable public-data snapshot:
 ```
 
 The partition command emits two different content-addressed manifests. Only the
-`PREHOLDOUT` manifest is accepted by candidate selection. It commits to, but
-does not score, the separate `LOCKED_HOLDOUT` bytes.
+`PREHOLDOUT` manifest is accepted by candidate selection. Before any price read,
+selection performs a metadata-only PRE/config gate; a supplied FULL or LOCKED
+manifest is rejected. PRE binds the separate `LOCKED_HOLDOUT` manifest by exact
+path, file SHA-256, paired descriptor, data commitment, and lockbox ID, but does
+not read or score its price bytes.
 
 ```powershell
 & .\.venv\Scripts\python.exe -m ben_trade_lab research select --manifest <preholdout-manifest>
@@ -81,6 +96,20 @@ does not score, the separate `LOCKED_HOLDOUT` bytes.
   --model-visible "<visible label>" --reasoning-visible "<visible label>"
 ```
 
+The canonical create-only anchor store was provisioned once outside the
+repository before candidate selection. v1.2 freezes both its 64-hex `store_id`
+and unique descriptor hash in the configuration. Deployment must copy the
+complete store—including all records—rather than initialize an empty
+replacement; there is intentionally no `anchor init`, reset, repair, or delete
+command. Its machine-specific absolute path is not embedded in research
+artifacts.
+
+```powershell
+& .\.venv\Scripts\python.exe -m ben_trade_lab anchor verify `
+  --anchor-root '<absolute-external-anchor-root>' `
+  --anchor-store-id <64-hex-store-id>
+```
+
 Finalization is deliberately one shot. It requires the exact source-bound test
 and independent-review receipts. The already-ended 2024-08 through 2026-07
 segment is reported as `RETROSPECTIVE_LOCKED_OOS`, not prospective proof.
@@ -88,12 +117,16 @@ segment is reported as `RETROSPECTIVE_LOCKED_OOS`, not prospective proof.
 ```powershell
 & .\.venv\Scripts\python.exe -m ben_trade_lab research finalize `
   --manifest <locked-holdout-manifest> --selection <selection> `
-  --test-receipt <test-receipt> --review-receipt <review-receipt>
+  --test-receipt <test-receipt> --review-receipt <review-receipt> `
+  --anchor-root '<absolute-external-anchor-root>' `
+  --anchor-store-id <64-hex-store-id>
 ```
 
-Once an experiment records `HOLDOUT_OPENED`, interruption or failure cannot be
-retried against the same study generation. A failure is `NOT_PROVEN`; it is not
-permission to weaken dates, costs, parameters, or gates.
+Before any locked price byte is loaded, finalization durably creates the
+experiment's external `HOLDOUT_OPENED` anchor and then its linked local state.
+Once the external record exists, interruption, local-state deletion, or failure
+cannot be retried against the same study generation. A failure is
+`NOT_PROVEN`; it is not permission to weaken dates, costs, parameters, or gates.
 
 Paper initialization is also gated. It requires a self-hashed
 `BACKTEST_CANDIDATE` report plus the exact selection, passing test receipt,
@@ -101,7 +134,10 @@ Paper initialization is also gated. It requires a self-hashed
 configuration, lockbox, and data commitments bound by that report:
 
 ```powershell
-& .\.venv\Scripts\python.exe -m ben_trade_lab paper init --report <holdout-report>
+& .\.venv\Scripts\python.exe -m ben_trade_lab paper init `
+  --report <holdout-report> `
+  --anchor-root '<absolute-external-anchor-root>' `
+  --anchor-store-id <64-hex-store-id>
 ```
 
 `paper run-once` remains fail-closed until the causal forward runner and replay
@@ -116,6 +152,8 @@ or network adapter for live trading.
   reject upstream source drift before accepting downloaded bytes
 - `artifacts/`: ignored selections, test receipts, reviews, and OOS reports
 - `state/experiments/`: ignored one-shot state-transition receipts
+- external anchor store: portable, create-only per-experiment opening records;
+  it must remain outside the repository and is never committed
 - `docs/reviews/`: sanitized review summaries only
 
 Start with [the research contract](docs/RESEARCH_CONTRACT.md) and

@@ -12,6 +12,13 @@ from typing import Any
 from .models import StrategyParams
 
 ALLOWED_MARKET_DATA_URL = "https://data-api.binance.vision"
+CANONICAL_ANCHOR_STORE_ID = (
+    "64acdb6e068cd88f1db2045ebf0dd2f6d93c6710b338f2b4e4898c927e4ef47e"
+)
+CANONICAL_ANCHOR_STORE_SHA256 = (
+    "0f12006fa9f7d5137faa77f694b59bce4afe34899f93ca9785d1ab923ab1a995"
+)
+CANONICAL_ANCHOR_POLICY = "CREATE_ONLY_PER_EXPERIMENT_HASH_CHAIN_V1"
 
 
 def parse_utc_ms(value: str) -> int:
@@ -51,6 +58,10 @@ class LabConfig:
     @property
     def acceptance(self) -> dict[str, Any]:
         return self.raw["acceptance"]
+
+    @property
+    def anchor(self) -> dict[str, Any]:
+        return self.raw["anchor"]
 
     @property
     def config_sha256(self) -> str:
@@ -109,19 +120,20 @@ def _validate(raw: dict[str, Any]) -> None:
         "selection",
         "acceptance",
         "diagnostics",
+        "anchor",
         "paper",
     }
     missing = required.difference(raw)
     if missing:
         raise ValueError(f"missing config sections: {sorted(missing)}")
     project = raw["project"]
-    if project.get("contract_version") != "1.1.0":
-        raise ValueError("this source tree implements only frozen contract v1.1.0")
+    if project.get("contract_version") != "1.2.0":
+        raise ValueError("this source tree implements only frozen contract v1.2.0")
     if project.get("status") != "RESEARCH_NOT_YET_VALIDATED":
         raise ValueError("the config may not pre-claim a validated research status")
     market = raw["market"]
     if market.get("venue") != "BINANCE_SPOT":
-        raise ValueError("v1.1 is fixed to Binance spot market data")
+        raise ValueError("v1.2 is fixed to Binance spot market data")
     if market.get("source_base_url") != ALLOWED_MARKET_DATA_URL:
         raise ValueError("only the Binance market-data-only host is allowed")
     if market.get("symbol") != "BTCUSDT" or market.get("interval") != "1h":
@@ -134,7 +146,7 @@ def _validate(raw: dict[str, Any]) -> None:
         market.get("start_utc") != "2017-08-17T04:00:00Z"
         or market.get("end_utc_exclusive") != "2026-08-01T00:00:00Z"
     ):
-        raise ValueError("v1.1 source interval is frozen")
+        raise ValueError("v1.2 source interval is frozen")
     registry_sha = market.get("exception_registry_sha256")
     if not isinstance(registry_sha, str) or len(registry_sha) != 64:
         raise ValueError("exception registry SHA-256 is missing")
@@ -147,17 +159,26 @@ def _validate(raw: dict[str, Any]) -> None:
         "signal_fill_delay_bars": 1,
     }
     if any(float(execution.get(key, -1.0)) != value for key, value in exact_execution.items()):
-        raise ValueError("v1.1 cash, cost, exposure, and base-latency assumptions are frozen")
+        raise ValueError("v1.2 cash, cost, exposure, and base-latency assumptions are frozen")
     if execution.get("allow_short") is not False or execution.get("allow_leverage") is not False:
         raise ValueError("shorting and leverage must remain disabled")
     if int(execution.get("signal_fill_delay_bars", 0)) < 1:
         raise ValueError("signals must fill at least one bar later")
-    if execution.get("fill_eligibility") != "OFFICIAL_POSITIVE_VOLUME_ONLY":
-        raise ValueError("fills require an official positive-volume bar")
-    if execution.get("unfilled_intent_policy") != "DEFER_UNTIL_NEXT_ELIGIBLE_OR_CANCEL":
-        raise ValueError("unfilled intent policy is not the frozen v1.1 policy")
-    if execution.get("terminal_valuation") != "LIQUIDATE_AT_FINAL_CLOSE_WITH_COSTS":
-        raise ValueError("terminal valuation must include liquidation costs")
+    if (
+        execution.get("fill_eligibility")
+        != "OFFICIAL_POSITIVE_VOLUME_AND_TRADE_COUNT"
+    ):
+        raise ValueError("fills require an official positive-volume positive-trade bar")
+    if (
+        execution.get("unfilled_intent_policy")
+        != "DEFER_THROUGH_INELIGIBLE_UNTIL_ELIGIBLE_FILL_OR_ELIGIBLE_CANCEL"
+    ):
+        raise ValueError("unfilled intent policy is not the frozen v1.2 policy")
+    if (
+        execution.get("terminal_valuation")
+        != "LIQUIDATE_AT_FINAL_ELIGIBLE_CLOSE_WITH_COSTS_ELSE_NOT_PROVEN"
+    ):
+        raise ValueError("terminal valuation must fail closed when liquidation is ineligible")
     exposure = float(execution.get("maximum_gross_exposure", 0.0))
     if not 0.0 < exposure <= 1.0:
         raise ValueError("gross exposure must be within (0, 1]")
@@ -173,7 +194,7 @@ def _validate(raw: dict[str, Any]) -> None:
         or raw["splits"].get("validation_end_utc_exclusive") != "2024-08-01T00:00:00Z"
         or raw["splits"].get("locked_holdout_end_utc_exclusive") != "2026-08-01T00:00:00Z"
     ):
-        raise ValueError("v1.1 chronology is frozen")
+        raise ValueError("v1.2 chronology is frozen")
     strategy = raw["strategy"]
     exact_strategy = {
         "family": "DONCHIAN_TREND_VOL_TARGET",
@@ -185,28 +206,28 @@ def _validate(raw: dict[str, Any]) -> None:
         "volatility_floor": 0.10,
     }
     if any(strategy.get(key) != value for key, value in exact_strategy.items()):
-        raise ValueError("v1.1 strategy family and parameter grid are frozen")
+        raise ValueError("v1.2 strategy family and parameter grid are frozen")
     selection = raw["selection"]
     if selection.get("objective") != "MEDIAN_WALK_FORWARD_CALMAR":
-        raise ValueError("v1.1 uses the frozen median walk-forward Calmar objective")
+        raise ValueError("v1.2 uses the frozen median walk-forward Calmar objective")
     if int(selection.get("maximum_trials", 0)) != 16:
-        raise ValueError("v1.1 trial budget is exactly 16 candidates")
+        raise ValueError("v1.2 trial budget is exactly 16 candidates")
     if int(selection.get("expected_fold_count", 0)) != 9:
-        raise ValueError("v1.1 requires exactly nine scoring folds")
+        raise ValueError("v1.2 requires exactly nine scoring folds")
     scoring_start = parse_utc_ms(selection["scoring_start_utc"])
     if scoring_start != parse_utc_ms("2020-02-01T00:00:00Z"):
-        raise ValueError("v1.1 scoring start is frozen at 2020-02-01 UTC")
+        raise ValueError("v1.2 scoring start is frozen at 2020-02-01 UTC")
     if int(selection.get("minimum_fold_months", 0)) != 6:
-        raise ValueError("v1.1 uses exact six-month folds")
+        raise ValueError("v1.2 uses exact six-month folds")
     if int(selection.get("minimum_fold_completed_round_trips", -1)) != 2:
-        raise ValueError("v1.1 fold round-trip floor is frozen at two")
+        raise ValueError("v1.2 fold round-trip floor is frozen at two")
     minimum_exposure = float(selection.get("minimum_fold_exposure_fraction", -1.0))
     maximum_exposure = float(selection.get("maximum_fold_exposure_fraction", -1.0))
     if minimum_exposure != 0.05 or maximum_exposure != 0.95:
-        raise ValueError("v1.1 fold exposure bounds are frozen")
+        raise ValueError("v1.2 fold exposure bounds are frozen")
     positive_fraction = float(selection.get("minimum_positive_fold_fraction", -1.0))
     if positive_fraction != 0.75:
-        raise ValueError("v1.1 positive-fold threshold is frozen")
+        raise ValueError("v1.2 positive-fold threshold is frozen")
     acceptance = raw["acceptance"]
     exact_acceptance = {
         "minimum_holdout_sharpe": 0.80,
@@ -218,16 +239,23 @@ def _validate(raw: dict[str, Any]) -> None:
         "maximum_single_quarter_profit_concentration": 0.50,
     }
     if any(float(acceptance.get(key, -1.0)) != value for key, value in exact_acceptance.items()):
-        raise ValueError("v1.1 acceptance gates are frozen")
+        raise ValueError("v1.2 acceptance gates are frozen")
     diagnostics = raw["diagnostics"]
     if int(diagnostics.get("moving_block_bootstrap_resamples", 0)) != 2000:
-        raise ValueError("v1.1 bootstrap resample count is frozen at 2000")
+        raise ValueError("v1.2 bootstrap resample count is frozen at 2000")
     if int(diagnostics.get("moving_block_length_days", 0)) != 7:
-        raise ValueError("v1.1 moving-block length is frozen at seven days")
+        raise ValueError("v1.2 moving-block length is frozen at seven days")
     if int(diagnostics.get("latency_stress_delay_bars", 0)) != 2:
-        raise ValueError("v1.1 latency stress is frozen at two bars")
+        raise ValueError("v1.2 latency stress is frozen at two bars")
     if diagnostics.get("seed_policy") != "SHA256_EXPERIMENT_ID":
         raise ValueError("diagnostic seed policy mismatch")
+    anchor = raw["anchor"]
+    if anchor.get("store_id") != CANONICAL_ANCHOR_STORE_ID:
+        raise ValueError("v1.2 external anchor store identity is frozen")
+    if anchor.get("store_sha256") != CANONICAL_ANCHOR_STORE_SHA256:
+        raise ValueError("v1.2 external anchor store descriptor is frozen")
+    if anchor.get("policy") != CANONICAL_ANCHOR_POLICY:
+        raise ValueError("v1.2 external anchor policy is frozen")
     paper = raw["paper"]
     exact_paper = {
         "minimum_calendar_days": 180,
@@ -235,4 +263,4 @@ def _validate(raw: dict[str, Any]) -> None:
         "maximum_tracking_error_bps": 10.0,
     }
     if any(float(paper.get(key, -1.0)) != value for key, value in exact_paper.items()):
-        raise ValueError("v1.1 paper-validation gates are frozen")
+        raise ValueError("v1.2 paper-validation gates are frozen")

@@ -1,4 +1,4 @@
-# Research contract v1.1.0
+# Research contract v1.2.0
 
 ## Question
 
@@ -45,20 +45,32 @@ and a new future holdout.
   negative.
 - No same-bar signal fills, intrabar stop assumptions, limit-order rebates, or
   unmodelled maker fills.
-- A fill requires an official bar with positive source volume. A pending regime
-  change retains its original signal timestamp through synthetic or zero-volume
-  bars, executes at the first eligible bar, or is cancelled if a newer signal
-  returns to the current portfolio regime. Positive target changes never add to
-  or rebalance an existing long.
+- A strategy-state/fill-eligible bar must be official, non-synthetic, and have
+  both positive source volume and positive source trade count. Every other bar
+  advances UTC time only: it cannot age or update Donchian, trend, return, or
+  volatility buffers; generate, resize, or cancel an intent; change the
+  long/cash regime; or execute a fill. A pending regime change from an earlier
+  eligible signal retains its original signal timestamp until the first later
+  eligible bar executes it or a later eligible signal cancels it. Positive
+  target changes never add to or rebalance an existing long.
 - Any terminal open position is valued as an adverse sale at the final close,
-  including exit slippage and fee. This liquidation affects performance but is
-  not counted as a completed strategy round trip.
+  including exit slippage and fee, only when the final bar is itself
+  strategy-state/fill eligible. If terminal liquidation is required but the
+  final bar is ineligible, evaluation fails closed as
+  `TERMINAL_LIQUIDATION_NOT_EXECUTABLE`; it may not extend the window or assume
+  a synthetic sale. A valid liquidation affects performance but is not counted
+  as a completed strategy round trip.
 - Official source gaps are never silently treated as observed trading. Each
   missing UTC hour is ledgered; the deterministic `CARRY_FORWARD_NO_FILL`
-  sensitivity policy carries the last close, freezes strategy state, and
-  prohibits fills on synthetic hours. Results must disclose the event and
-  missing-hour counts. Any unledgered, duplicate, unordered, or misaligned gap
-  fails closed.
+  sensitivity policy carries the last close, freezes every indicator, regime,
+  and pending-intent state, and prohibits fills on synthetic hours. Results
+  must disclose the event and missing-hour counts. Any unledgered, duplicate,
+  unordered, or misaligned gap fails closed.
+- The buy-and-hold diagnostic follows the same causal engine and costs: its
+  100% long target is first signalled at the close of the first eligible OOS
+  bar, can fill no earlier than the open of the next eligible OOS bar, and is
+  valued by the same costed final-eligible-close rule. It is a benchmark only
+  and cannot replace the selected primary candidate.
 
 ## Acceptance gates
 
@@ -108,11 +120,48 @@ account identifiers or private data.
 
 The full source snapshot is deterministically partitioned into a pre-OOS
 manifest and a separately committed retrospective-OOS manifest. Candidate
-selection must reject any manifest containing an OOS bar. Finalization requires exact
-config, source, code, data, passing-test, and Pro-review receipts. An atomic
-experiment receipt transitions `FROZEN -> HOLDOUT_OPENED -> FINALIZED`; once
-`HOLDOUT_OPENED` exists, a failed or interrupted run cannot inspect that OOS
-segment again.
+selection performs a metadata-only PRE/config gate before any price I/O and
+must reject FULL or LOCKED inputs before their price files are read. The PRE
+manifest binds the exact LOCKED manifest path, file hash, paired descriptor,
+data commitment, and lockbox ID without loading or scoring LOCKED prices.
+Finalization requires
+exact config, source, code, data, passing-test, and Pro-review receipts. A
+canonical, crash-durable, self-hashed experiment receipt chain transitions
+`FROZEN -> external HOLDOUT_OPENED anchor -> local HOLDOUT_OPENED -> FINALIZED`.
+The external store is an absolute, explicitly supplied directory outside the
+repository and is bound by both the canonical 64-hex store ID and the unique
+canonical descriptor SHA-256 frozen in the v1.2 configuration and source before
+candidate selection. The store is provisioned once; ordinary CLI operation can
+verify it but cannot initialize, replace, reset, repair, or delete it. Deployment
+must copy the complete store, including every record, while no absolute machine
+path is stored in research artifacts.
+Every state binds the previous state hash and the exact
+selection/config/source/data/test/review/report
+commitments appropriate to that transition. `FROZEN`, manifest metadata, and
+both audit receipts are fully validated before the opening event. The external
+record is then exclusively created and durably flushed before the linked local
+state, and both are re-read before any locked price byte is loaded. Any existing,
+partial, corrupt, missing, or inconsistent external/local opening record fails
+closed. Once the external record exists, the experiment is permanently
+consumed even if the local experiment directory is deleted or the process
+crashes. Neither a retry, repair, force, reset, nor prune operation exists.
+
+This create-only store protects against ordinary repository rollback and
+accidental local-state deletion. Its pinned descriptor rejects a newly created
+empty store that merely reuses the public store ID. Without a signing key,
+operating-system WORM, or an independent remote witness, it does not claim to
+defeat an administrator who duplicates the descriptor before use, selectively
+deletes records, or deletes or rewrites every copy of both the repository and
+anchor store.
+
+Before opening the holdout, a separately gated data-only provenance replay may
+parse the full source solely to verify raw bytes, canonical normalization,
+registered anomalies, partition boundaries, and commitments. It must not
+return price rows to the researcher/model, call strategy or metric code, or
+emit any locked-period performance. The ordinary test suite leaves this replay
+disabled; explicit isolated mode may expose only hashes, counts, and PASS/FAIL.
+The strategy/evaluation path cannot load the locked manifest until the
+authenticated `HOLDOUT_OPENED` state has been durably committed.
 
 The nine pre-OOS folds share one continuous strategy/account run. The
 retrospective OOS separately resets both strategy and portfolio to cash while
@@ -121,23 +170,33 @@ signal is required; no pre-OOS position is synthesized.
 
 ## Exact signal semantics
 
-- Entry channel: maximum official or policy-derived high of the previous `N`
-  bars, excluding bar `t`; entry requires strict `close[t] > channel`.
-- Exit channel: minimum low of the previous `N` bars, excluding `t`; exit uses
-  strict `close[t] < channel`.
-- Trend filter: simple mean of the most recent `N` closes including `t`; entry
-  requires strict `close[t] > mean`, while an existing long exits on strict
-  `close[t] < mean`.
-- Volatility: sample standard deviation of hourly log returns through `t`, over
-  the frozen lookback, annualized by `sqrt(365.25 * 24)`. A 720-return window
-  requires 721 closes; no artificial zero return is inserted, and volatility
-  is unavailable one bar earlier.
+- Indicator buffers contain strategy-state-eligible observations only.
+  Synthetic, zero-volume, and zero-trade bars advance UTC elapsed time but do
+  not enter or age any rolling buffer. The existing `_hours` parameter names
+  retain their frozen numeric values and denote counts of eligible hourly-source
+  observations under this policy.
+- Entry channel: maximum eligible high of the previous `N` eligible
+  observations, excluding eligible bar `t`; entry requires strict
+  `close[t] > channel`.
+- Exit channel: minimum eligible low of the previous `N` eligible observations,
+  excluding `t`; exit uses strict `close[t] < channel`.
+- Trend filter: simple mean of the most recent `N` eligible closes including
+  `t`; entry requires strict `close[t] > mean`, while an existing long exits on
+  strict `close[t] < mean`.
+- Volatility: sample standard deviation of log returns between consecutive
+  eligible closes through `t`, over the frozen lookback, annualized by
+  `sqrt(365.25 * 24)`. A 720-return window requires 721 eligible closes; no
+  artificial zero return is inserted, and volatility is unavailable one
+  eligible observation earlier.
 - Exposure is `min(1, target_vol / max(realized_vol, volatility_floor))`, fixed
   when the entry signal occurs and unchanged until exit.
 - When long, exit logic has priority and the same close cannot exit and re-enter.
 - Folds and OOS score UTC daily end-equity returns with zero cash risk-free
-  rate, hourly mark-to-market drawdown, exact elapsed-time CAGR, and terminal
-  liquidation value.
+  rate, hourly mark-to-market drawdown, exact elapsed-time CAGR, and valid
+  terminal liquidation value. The first daily return is always the evaluation
+  boundary equity to the first complete UTC day end; that same boundary-aware
+  daily series is used for fold, OOS, cost stress, latency stress, benchmark,
+  and calendar-quarter concentration metrics.
 
 ## Registered source anomalies
 

@@ -14,11 +14,59 @@ from pathlib import Path
 from typing import Any
 
 from .config import ALLOWED_MARKET_DATA_URL, LabConfig, canonical_json, parse_utc_ms
+from .integrity import (
+    require_plain_parent_chain_for_create,
+    require_plain_regular_single_link,
+)
 from .models import Bar
 
 HOUR_MS = 3_600_000
 DATA_EXCEPTION_REGISTRY_PATH = "configs/data_exceptions_v1.json"
 DATA_EXCEPTION_REGISTRY_SHA256 = "5d45208bf3ca72d38b92b671694c74921c5a3ee3ddbae850b30ee7893ca0a582"
+PARTITION_SCHEMA_VERSION = "1.2.0"
+PARTITION_BASE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "source",
+        "http_method",
+        "authentication",
+        "symbol",
+        "interval",
+        "timezone",
+        "gap_policy",
+        "requested_start_ms",
+        "requested_end_ms_exclusive",
+        "first_open_ms",
+        "last_open_ms",
+        "row_count",
+        "normalized_path",
+        "normalized_sha256",
+        "config_sha256",
+        "exception_registry_sha256",
+        "validation",
+        "declared_source_anomalies",
+        "parent_manifest_path",
+        "parent_manifest_sha256",
+        "parent_normalized_sha256",
+        "lockbox_id",
+        "preholdout_sha256",
+        "holdout_commitment_sha256",
+    }
+)
+PARTITION_LINK_FIELDS = frozenset(
+    {
+        "partition_descriptor_sha256",
+        "paired_partition_kind",
+        "paired_partition_descriptor_sha256",
+    }
+)
+PREHOLDOUT_LOCKED_MANIFEST_FIELDS = frozenset(
+    {
+        "locked_holdout_manifest_path",
+        "locked_holdout_manifest_sha256",
+    }
+)
 KLINE_COLUMNS = (
     "open_time_ms",
     "open",
@@ -48,6 +96,33 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _isolated_provenance_replay_enabled() -> bool:
+    """Read the one non-credential environment gate used by provenance replay."""
+
+    return os.environ.get("BEN_ISOLATED_PROVENANCE_REPLAY") == "1"
+
+
+def _require_plain_data_file(path: Path, label: str) -> Path:
+    """Translate the shared plain-file boundary into the data error domain."""
+
+    try:
+        return require_plain_regular_single_link(path, label)
+    except (OSError, ValueError) as exc:
+        raise DataIntegrityError(f"{label} must be a stable plain single-link file") from exc
+
+
+def _read_plain_data_bytes(path: Path, label: str) -> bytes:
+    """Read one plain file and retain only bytes observed inside two link checks."""
+
+    _require_plain_data_file(path, label)
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise DataIntegrityError(f"{label} is unavailable") from exc
+    _require_plain_data_file(path, label)
+    return payload
+
+
 def _canonical_decimal(value: Any) -> str:
     try:
         decimal = Decimal(str(value))
@@ -72,14 +147,24 @@ def _canonical_int(value: Any) -> str:
 
 
 def _write_new_or_same(path: Path, payload: bytes) -> None:
+    try:
+        require_plain_parent_chain_for_create(path, "immutable data file")
+    except (OSError, ValueError) as exc:
+        raise DataIntegrityError("immutable data parent path is unsafe") from exc
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        if path.read_bytes() != payload:
+    try:
+        require_plain_parent_chain_for_create(path, "immutable data file")
+    except (OSError, ValueError) as exc:
+        raise DataIntegrityError("immutable data parent path is unsafe") from exc
+    try:
+        with path.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError:
+        if _read_plain_data_bytes(path, "immutable data file") != payload:
             raise DataIntegrityError(f"immutable file collision: {path}")
-        return
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_bytes(payload)
-    temporary.replace(path)
+    _require_plain_data_file(path, "immutable data file")
 
 
 def _market_data_get(url: str, timeout_seconds: float = 30.0) -> bytes:
@@ -106,7 +191,7 @@ def _market_data_get(url: str, timeout_seconds: float = 30.0) -> bytes:
         method="GET",
         headers={
             "Accept": "application/json",
-            "User-Agent": "ben-autotrade-lab/0.1",
+            "User-Agent": "ben-autotrade-lab/0.2",
             "X-MBX-TIME-UNIT": "millisecond",
         },
     )
@@ -362,15 +447,16 @@ def _validate_exception_registry_structure(registry: dict[str, Any]) -> None:
 def _load_exception_registry(
     root: Path, *, expected_sha256: str | None = None
 ) -> tuple[dict[str, Any], str]:
-    path = (root / DATA_EXCEPTION_REGISTRY_PATH).resolve()
+    unresolved = root / DATA_EXCEPTION_REGISTRY_PATH
+    path = unresolved.resolve()
     try:
         path.relative_to((root / "configs").resolve())
     except ValueError as exc:
         raise DataIntegrityError("data exception registry escaped configs") from exc
-    try:
-        payload = path.read_bytes()
-    except OSError as exc:
-        raise DataIntegrityError("data exception registry is unavailable") from exc
+    _require_plain_data_file(unresolved, "data exception registry")
+    if unresolved.resolve() != path:
+        raise DataIntegrityError("data exception registry changed during path validation")
+    payload = _read_plain_data_bytes(path, "data exception registry")
     registry_sha = _sha256(payload)
     if registry_sha != DATA_EXCEPTION_REGISTRY_SHA256:
         raise DataIntegrityError("data exception registry hash mismatch")
@@ -582,6 +668,17 @@ def _resolve_inside(root: Path, relative: str, allowed: Path) -> Path:
     return candidate
 
 
+def _resolve_plain_file_inside(
+    root: Path, relative: str, allowed: Path, label: str
+) -> Path:
+    unresolved = root / relative
+    resolved = _resolve_inside(root, relative, allowed)
+    _require_plain_data_file(unresolved, label)
+    if unresolved.resolve() != resolved:
+        raise DataIntegrityError(f"{label} changed during path validation")
+    return resolved
+
+
 def _manifest_file(path: str | Path, root: Path) -> tuple[Path, bytes, dict[str, Any], str]:
     candidate = Path(path)
     if not candidate.is_absolute():
@@ -591,7 +688,10 @@ def _manifest_file(path: str | Path, root: Path) -> tuple[Path, bytes, dict[str,
         manifest_path.relative_to((root / "data" / "manifests").resolve())
     except ValueError as exc:
         raise DataIntegrityError("manifest must be inside data/manifests") from exc
-    payload = manifest_path.read_bytes()
+    _require_plain_data_file(candidate, "manifest")
+    if candidate.resolve() != manifest_path:
+        raise DataIntegrityError("manifest changed during path validation")
+    payload = _read_plain_data_bytes(manifest_path, "manifest")
     digest = _sha256(payload)
     match = re.search(r"-([0-9a-f]{16})\.json$", manifest_path.name)
     if match is None or not digest.startswith(match.group(1)):
@@ -675,8 +775,13 @@ def _verify_full_raw_provenance(
             raise DataIntegrityError("raw batch metadata must be an object")
         if int(batch["request_start_ms"]) != expected_request_start:
             raise DataIntegrityError("raw batch request sequence is discontinuous")
-        raw_path = _resolve_inside(root, str(batch["raw_path"]), root / "data" / "raw")
-        raw_payload = raw_path.read_bytes()
+        raw_path = _resolve_plain_file_inside(
+            root,
+            str(batch["raw_path"]),
+            root / "data" / "raw",
+            "raw market-data batch",
+        )
+        raw_payload = _read_plain_data_bytes(raw_path, "raw market-data batch")
         raw_sha = _sha256(raw_payload)
         if raw_sha != batch["raw_sha256"]:
             raise DataIntegrityError(f"raw batch hash mismatch: {raw_path}")
@@ -734,34 +839,99 @@ def _lockbox_id(
     )
 
 
-def _verify_partition_provenance(
+def _partition_exact_fields(kind: str) -> frozenset[str]:
+    if kind == "PREHOLDOUT":
+        return PARTITION_BASE_FIELDS | PARTITION_LINK_FIELDS | PREHOLDOUT_LOCKED_MANIFEST_FIELDS
+    if kind == "LOCKED_HOLDOUT":
+        return PARTITION_BASE_FIELDS | PARTITION_LINK_FIELDS
+    raise DataIntegrityError("partition provenance requires a partition manifest")
+
+
+def _partition_descriptor_sha256(manifest: dict[str, Any]) -> str:
+    try:
+        base = {field: manifest[field] for field in PARTITION_BASE_FIELDS}
+    except KeyError as exc:
+        raise DataIntegrityError(f"partition descriptor field is missing: {exc.args[0]}") from exc
+    return _sha256(canonical_json(base))
+
+
+def _validate_partition_manifest_schema(
+    manifest: dict[str, Any], *, payload: bytes | None = None
+) -> None:
+    kind = manifest.get("kind")
+    if not isinstance(kind, str):
+        raise DataIntegrityError("partition kind is missing")
+    if set(manifest) != _partition_exact_fields(kind):
+        raise DataIntegrityError("partition manifest schema mismatch")
+    if manifest.get("schema_version") != PARTITION_SCHEMA_VERSION:
+        raise DataIntegrityError("partition manifest schema version mismatch")
+    if payload is not None and payload != canonical_json(manifest) + b"\n":
+        raise DataIntegrityError("partition manifest is not canonical JSON")
+    descriptor = manifest.get("partition_descriptor_sha256")
+    paired_descriptor = manifest.get("paired_partition_descriptor_sha256")
+    for field, value in (
+        ("partition_descriptor_sha256", descriptor),
+        ("paired_partition_descriptor_sha256", paired_descriptor),
+    ):
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise DataIntegrityError(f"partition {field} is malformed")
+    if descriptor != _partition_descriptor_sha256(manifest):
+        raise DataIntegrityError("partition descriptor commitment mismatch")
+    if descriptor == paired_descriptor:
+        raise DataIntegrityError("partition descriptor cannot pair with itself")
+    expected_pair = "LOCKED_HOLDOUT" if kind == "PREHOLDOUT" else "PREHOLDOUT"
+    if manifest.get("paired_partition_kind") != expected_pair:
+        raise DataIntegrityError("partition paired kind mismatch")
+    if kind == "PREHOLDOUT":
+        locked_path = manifest.get("locked_holdout_manifest_path")
+        if (
+            not isinstance(locked_path, str)
+            or not locked_path
+            or "\\" in locked_path
+            or Path(locked_path).is_absolute()
+            or ".." in Path(locked_path).parts
+        ):
+            raise DataIntegrityError("paired locked manifest path is malformed")
+        locked_sha = manifest.get("locked_holdout_manifest_sha256")
+        if not isinstance(locked_sha, str) or re.fullmatch(r"[0-9a-f]{64}", locked_sha) is None:
+            raise DataIntegrityError("paired locked manifest hash is malformed")
+
+
+def _partition_parent_metadata(
     manifest: dict[str, Any],
-    rows: list[tuple[str, ...]],
-    normalized_payload: bytes,
     root: Path,
     *,
     observed_at_ms: int,
-) -> None:
-    kind = manifest.get("kind")
-    if kind not in {"PREHOLDOUT", "LOCKED_HOLDOUT"}:
-        raise DataIntegrityError("partition provenance requires a partition manifest")
+    registry: dict[str, Any] | None = None,
+) -> tuple[Path, dict[str, Any], str]:
     parent_relative = manifest.get("parent_manifest_path")
     if not isinstance(parent_relative, str):
         raise DataIntegrityError("partition parent manifest path is missing")
-    parent_path = _resolve_inside(root, parent_relative, root / "data" / "manifests")
-    parent_sha = _sha256(parent_path.read_bytes())
+    parent_path = _resolve_plain_file_inside(
+        root,
+        parent_relative,
+        root / "data" / "manifests",
+        "partition parent manifest",
+    )
+    parent_path, _, parent, parent_sha = _manifest_file(parent_path, root)
     if parent_sha != manifest.get("parent_manifest_sha256"):
         raise DataIntegrityError("parent manifest commitment mismatch")
-    parent = verify_manifest(parent_path, root=root, as_of_ms=observed_at_ms)
+    if parent_path.relative_to(root).as_posix() != parent_relative:
+        raise DataIntegrityError("partition parent path is not canonical")
     if parent.get("kind", "FULL_SOURCE") != "FULL_SOURCE":
         raise DataIntegrityError("partition parent is not a full-source manifest")
-    if parent.get("manifest_file_sha256") != parent_sha:
-        raise DataIntegrityError("verified parent manifest hash mismatch")
-    if parent.get("manifest_path") != parent_relative:
-        raise DataIntegrityError("partition parent path is not canonical")
+    if registry is not None:
+        _assert_registered_full_source_identity(parent, registry, root)
+    completed_boundary_ms = observed_at_ms // HOUR_MS * HOUR_MS
+    if int(parent["requested_end_ms_exclusive"]) > completed_boundary_ms:
+        raise DataIntegrityError("partition parent includes an incomplete hourly bar")
     if parent.get("normalized_sha256") != manifest.get("parent_normalized_sha256"):
         raise DataIntegrityError("partition parent dataset commitment mismatch")
-    if parent.get("exception_registry_sha256") != manifest.get("exception_registry_sha256"):
+    parent_registry = parent.get("exception_registry_sha256")
+    if (
+        parent_registry is not None
+        and parent_registry != manifest.get("exception_registry_sha256")
+    ):
         raise DataIntegrityError("partition registry differs from its parent")
     for field in (
         "source",
@@ -774,24 +944,18 @@ def _verify_partition_provenance(
     ):
         if manifest.get(field) != parent.get(field):
             raise DataIntegrityError(f"partition {field} differs from its parent")
-    parent_normalized_path = _resolve_inside(
-        root,
-        str(parent["normalized_path"]),
-        root / "data" / "normalized",
-    )
-    parent_payload = parent_normalized_path.read_bytes()
-    if _sha256(parent_payload) != manifest.get("parent_normalized_sha256"):
-        raise DataIntegrityError("partition parent normalized bytes changed")
-    parent_rows = _rows_from_csv(parent_payload)
-    if parent_payload != _csv_bytes(parent_rows):
-        raise DataIntegrityError("partition parent normalized CSV is not canonical")
+    return parent_path, parent, parent_sha
+
+
+def _verify_partition_commitments(manifest: dict[str, Any], parent: dict[str, Any]) -> None:
+    kind = str(manifest["kind"])
     start_ms = int(manifest["requested_start_ms"])
     end_ms = int(manifest["requested_end_ms_exclusive"])
     parent_start = int(parent["requested_start_ms"])
     parent_end = int(parent["requested_end_ms_exclusive"])
     expected_normalized_path = (
         f"data/normalized/{manifest['symbol']}-{manifest['interval']}-"
-        f"{str(kind).lower()}-{start_ms}-{end_ms}-"
+        f"{kind.lower()}-{start_ms}-{end_ms}-"
         f"{str(manifest['normalized_sha256'])[:16]}.csv"
     )
     if manifest.get("normalized_path") != expected_normalized_path:
@@ -804,9 +968,6 @@ def _verify_partition_provenance(
         if end_ms != parent_end or not parent_start < start_ms < end_ms:
             raise DataIntegrityError("holdout boundaries do not partition the parent")
         holdout_start_ms = start_ms
-    expected_rows = [row for row in parent_rows if start_ms <= int(row[0]) < end_ms]
-    if rows != expected_rows or normalized_payload != _csv_bytes(expected_rows):
-        raise DataIntegrityError("partition bytes are not the exact parent slice")
     config_sha = manifest.get("config_sha256")
     registry_sha = manifest.get("exception_registry_sha256")
     parent_normalized_sha = manifest.get("parent_normalized_sha256")
@@ -825,11 +986,11 @@ def _verify_partition_provenance(
     if own_commitment != manifest.get("normalized_sha256"):
         raise DataIntegrityError("partition self-commitment mismatch")
     expected_lockbox_id = _lockbox_id(
-        config_sha256=config_sha,
-        exception_registry_sha256=registry_sha,
-        parent_normalized_sha256=parent_normalized_sha,
-        preholdout_sha256=preholdout_sha,
-        holdout_commitment_sha256=holdout_sha,
+        config_sha256=str(config_sha),
+        exception_registry_sha256=str(registry_sha),
+        parent_normalized_sha256=str(parent_normalized_sha),
+        preholdout_sha256=str(preholdout_sha),
+        holdout_commitment_sha256=str(holdout_sha),
         holdout_start_ms=holdout_start_ms,
         holdout_end_ms_exclusive=parent_end,
     )
@@ -837,22 +998,164 @@ def _verify_partition_provenance(
         raise DataIntegrityError("partition lockbox commitment mismatch")
 
 
+def _verify_preholdout_locked_pair(
+    preholdout: dict[str, Any], parent: dict[str, Any], root: Path
+) -> dict[str, Any]:
+    locked_relative = str(preholdout["locked_holdout_manifest_path"])
+    locked_path = _resolve_plain_file_inside(
+        root,
+        locked_relative,
+        root / "data" / "manifests",
+        "paired locked manifest",
+    )
+    locked_path, payload, locked, locked_sha = _manifest_file(locked_path, root)
+    if locked_path.relative_to(root).as_posix() != locked_relative:
+        raise DataIntegrityError("paired locked manifest path is not canonical")
+    if locked_sha != preholdout.get("locked_holdout_manifest_sha256"):
+        raise DataIntegrityError("paired locked manifest file commitment mismatch")
+    _validate_partition_manifest_schema(locked, payload=payload)
+    if locked.get("kind") != "LOCKED_HOLDOUT":
+        raise DataIntegrityError("paired manifest is not LOCKED_HOLDOUT")
+    _verify_partition_commitments(locked, parent)
+    if preholdout.get("paired_partition_descriptor_sha256") != locked.get(
+        "partition_descriptor_sha256"
+    ):
+        raise DataIntegrityError("preholdout locked descriptor commitment mismatch")
+    if locked.get("paired_partition_descriptor_sha256") != preholdout.get(
+        "partition_descriptor_sha256"
+    ):
+        raise DataIntegrityError("locked preholdout descriptor commitment mismatch")
+    common_fields = (
+        "source",
+        "http_method",
+        "authentication",
+        "symbol",
+        "interval",
+        "timezone",
+        "gap_policy",
+        "config_sha256",
+        "exception_registry_sha256",
+        "parent_manifest_path",
+        "parent_manifest_sha256",
+        "parent_normalized_sha256",
+        "lockbox_id",
+        "preholdout_sha256",
+        "holdout_commitment_sha256",
+    )
+    for field in common_fields:
+        if preholdout.get(field) != locked.get(field):
+            raise DataIntegrityError(f"paired partition {field} mismatch")
+    if int(preholdout["requested_end_ms_exclusive"]) != int(locked["requested_start_ms"]):
+        raise DataIntegrityError("paired partition boundary mismatch")
+    return locked
+
+
+def _verify_partition_metadata(
+    manifest: dict[str, Any],
+    root: Path,
+    *,
+    observed_at_ms: int,
+    manifest_payload: bytes | None = None,
+    registry: dict[str, Any] | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    _validate_partition_manifest_schema(manifest, payload=manifest_payload)
+    parent_path, parent, _ = _partition_parent_metadata(
+        manifest,
+        root,
+        observed_at_ms=observed_at_ms,
+        registry=registry,
+    )
+    _verify_partition_commitments(manifest, parent)
+    if manifest.get("kind") == "PREHOLDOUT":
+        _verify_preholdout_locked_pair(manifest, parent, root)
+    return parent_path, parent
+
+
+def _verify_partition_provenance(
+    manifest: dict[str, Any],
+    rows: list[tuple[str, ...]],
+    normalized_payload: bytes,
+    root: Path,
+    *,
+    observed_at_ms: int,
+    replay_full_parent: bool = False,
+    manifest_payload: bytes | None = None,
+    registry: dict[str, Any] | None = None,
+) -> None:
+    if replay_full_parent and not _isolated_provenance_replay_enabled():
+        raise DataIntegrityError("FULL_PARENT_REPLAY_REQUIRES_ISOLATED_PROVENANCE_MODE")
+    parent_path, parent = _verify_partition_metadata(
+        manifest,
+        root,
+        observed_at_ms=observed_at_ms,
+        manifest_payload=manifest_payload,
+        registry=registry,
+    )
+    if not replay_full_parent:
+        return
+    verified_parent = verify_manifest(parent_path, root=root, as_of_ms=observed_at_ms)
+    if verified_parent.get("manifest_file_sha256") != manifest.get("parent_manifest_sha256"):
+        raise DataIntegrityError("verified parent manifest hash mismatch")
+    parent_normalized_path = _resolve_plain_file_inside(
+        root,
+        str(parent["normalized_path"]),
+        root / "data" / "normalized",
+        "full-parent normalized dataset",
+    )
+    parent_payload = _read_plain_data_bytes(
+        parent_normalized_path, "full-parent normalized dataset"
+    )
+    if _sha256(parent_payload) != manifest.get("parent_normalized_sha256"):
+        raise DataIntegrityError("partition parent normalized bytes changed")
+    parent_rows = _rows_from_csv(parent_payload)
+    if parent_payload != _csv_bytes(parent_rows):
+        raise DataIntegrityError("partition parent normalized CSV is not canonical")
+    start_ms = int(manifest["requested_start_ms"])
+    end_ms = int(manifest["requested_end_ms_exclusive"])
+    expected_rows = [row for row in parent_rows if start_ms <= int(row[0]) < end_ms]
+    if rows != expected_rows or normalized_payload != _csv_bytes(expected_rows):
+        raise DataIntegrityError("partition bytes are not the exact parent slice")
+
+
 def verify_manifest(
     path: str | Path,
     root: str | Path = ".",
     *,
     as_of_ms: int | None = None,
+    expected_kind: str | None = None,
+    replay_full_parent: bool = False,
+    allow_locked_data: bool = False,
 ) -> dict[str, Any]:
     root_path = Path(root).resolve()
-    manifest_path, _, manifest, manifest_sha = _manifest_file(path, root_path)
-    normalized_path = _resolve_inside(
-        root_path, str(manifest["normalized_path"]), root_path / "data" / "normalized"
+    manifest_path, manifest_payload, manifest, manifest_sha = _manifest_file(path, root_path)
+    kind = manifest.get("kind", "FULL_SOURCE")
+    if kind not in {"FULL_SOURCE", "PREHOLDOUT", "LOCKED_HOLDOUT"}:
+        raise DataIntegrityError(f"unknown manifest kind: {kind}")
+    if expected_kind is not None:
+        if expected_kind not in {"FULL_SOURCE", "PREHOLDOUT", "LOCKED_HOLDOUT"}:
+            raise DataIntegrityError(f"unknown expected manifest kind: {expected_kind}")
+        if kind != expected_kind:
+            raise DataIntegrityError(f"expected {expected_kind} manifest, received {kind}")
+    if replay_full_parent:
+        if kind not in {"PREHOLDOUT", "LOCKED_HOLDOUT"}:
+            raise DataIntegrityError("FULL_PARENT_REPLAY_REQUIRES_PARTITION_MANIFEST")
+        if not _isolated_provenance_replay_enabled():
+            raise DataIntegrityError("FULL_PARENT_REPLAY_REQUIRES_ISOLATED_PROVENANCE_MODE")
+    if kind in {"PREHOLDOUT", "LOCKED_HOLDOUT"}:
+        _validate_partition_manifest_schema(manifest, payload=manifest_payload)
+    if kind == "LOCKED_HOLDOUT" and not (allow_locked_data or replay_full_parent):
+        raise DataIntegrityError("LOCKED_DATA_ACCESS_REQUIRES_DURABLE_OPEN_OR_ISOLATED_REPLAY")
+    normalized_path = _resolve_plain_file_inside(
+        root_path,
+        str(manifest["normalized_path"]),
+        root_path / "data" / "normalized",
+        "normalized dataset",
     )
     observed_at = int(datetime.now(UTC).timestamp() * 1000) if as_of_ms is None else int(as_of_ms)
     completed_boundary_ms = observed_at // HOUR_MS * HOUR_MS
     if int(manifest["requested_end_ms_exclusive"]) > completed_boundary_ms:
         raise DataIntegrityError("manifest includes an incomplete hourly bar")
-    payload = normalized_path.read_bytes()
+    payload = _read_plain_data_bytes(normalized_path, "normalized dataset")
     if _sha256(payload) != manifest.get("normalized_sha256"):
         raise DataIntegrityError("normalized dataset hash mismatch")
     rows = _rows_from_csv(payload)
@@ -876,9 +1179,6 @@ def verify_manifest(
         raise DataIntegrityError("manifest last_open_ms mismatch")
     if anomalies != manifest.get("declared_source_anomalies", []):
         raise DataIntegrityError("declared source anomaly ledger mismatch")
-    kind = manifest.get("kind", "FULL_SOURCE")
-    if kind not in {"FULL_SOURCE", "PREHOLDOUT", "LOCKED_HOLDOUT"}:
-        raise DataIntegrityError(f"unknown manifest kind: {kind}")
     declared_registry_sha = manifest.get("exception_registry_sha256")
     expected_registry_sha = (
         declared_registry_sha if isinstance(declared_registry_sha, str) else None
@@ -927,6 +1227,9 @@ def verify_manifest(
             payload,
             root_path,
             observed_at_ms=observed_at,
+            replay_full_parent=replay_full_parent,
+            manifest_payload=manifest_payload,
+            registry=registry,
         )
     verified = dict(manifest)
     verified["manifest_path"] = manifest_relative
@@ -937,7 +1240,24 @@ def verify_manifest(
 
 def read_manifest_metadata(path: str | Path, root: str | Path = ".") -> dict[str, Any]:
     root_path = Path(root).resolve()
-    manifest_path, _, manifest, manifest_sha = _manifest_file(path, root_path)
+    manifest_path, payload, manifest, manifest_sha = _manifest_file(path, root_path)
+    kind = manifest.get("kind", "FULL_SOURCE")
+    if kind in {"PREHOLDOUT", "LOCKED_HOLDOUT"}:
+        observed_at = int(datetime.now(UTC).timestamp() * 1000)
+        declared_registry_sha = manifest.get("exception_registry_sha256")
+        expected_registry_sha = (
+            declared_registry_sha if isinstance(declared_registry_sha, str) else None
+        )
+        registry, _ = _load_exception_registry(
+            root_path, expected_sha256=expected_registry_sha
+        )
+        _verify_partition_metadata(
+            manifest,
+            root_path,
+            observed_at_ms=observed_at,
+            manifest_payload=payload,
+            registry=registry,
+        )
     value = dict(manifest)
     value["manifest_path"] = manifest_path.relative_to(root_path).as_posix()
     value["manifest_file_sha256"] = manifest_sha
@@ -997,10 +1317,20 @@ def partition_lockbox(
     root_path = Path(root).resolve()
     full = verify_manifest(full_manifest_path, root=root_path)
     bind_manifest_to_config(full, config, "FULL_SOURCE")
-    normalized_path = _resolve_inside(
-        root_path, str(full["normalized_path"]), root_path / "data" / "normalized"
+    normalized_path = _resolve_plain_file_inside(
+        root_path,
+        str(full["normalized_path"]),
+        root_path / "data" / "normalized",
+        "full-source normalized dataset",
     )
-    rows = _rows_from_csv(normalized_path.read_bytes())
+    full_payload = _read_plain_data_bytes(
+        normalized_path, "full-source normalized dataset"
+    )
+    if _sha256(full_payload) != full["normalized_sha256"]:
+        raise DataIntegrityError("full-source dataset changed after manifest verification")
+    rows = _rows_from_csv(full_payload)
+    if full_payload != _csv_bytes(rows):
+        raise DataIntegrityError("full-source normalized CSV is not canonical")
     holdout_start = parse_utc_ms(config.splits["validation_end_utc_exclusive"])
     holdout_end = parse_utc_ms(config.splits["locked_holdout_end_utc_exclusive"])
     pre_rows = [row for row in rows if int(row[0]) < holdout_start]
@@ -1042,11 +1372,11 @@ def partition_lockbox(
         holdout_start_ms=holdout_start,
         holdout_end_ms_exclusive=holdout_end,
     )
-    output: dict[str, Path] = {}
+    base_manifests: dict[str, dict[str, Any]] = {}
     for kind in ("PREHOLDOUT", "LOCKED_HOLDOUT"):
         item = prepared[kind]
-        manifest = {
-            "schema_version": "1.1.0",
+        base_manifests[kind] = {
+            "schema_version": PARTITION_SCHEMA_VERSION,
             "kind": kind,
             "source": full["source"],
             "http_method": "GET",
@@ -1073,30 +1403,83 @@ def partition_lockbox(
             "preholdout_sha256": prepared["PREHOLDOUT"]["csv_sha"],
             "holdout_commitment_sha256": prepared["LOCKED_HOLDOUT"]["csv_sha"],
         }
-        output[kind] = _write_partition_manifest(root_path, item["stem"], manifest)
-    return output["PREHOLDOUT"], output["LOCKED_HOLDOUT"]
+    descriptors = {
+        kind: _sha256(canonical_json(base_manifests[kind]))
+        for kind in ("PREHOLDOUT", "LOCKED_HOLDOUT")
+    }
+    locked_manifest = {
+        **base_manifests["LOCKED_HOLDOUT"],
+        "partition_descriptor_sha256": descriptors["LOCKED_HOLDOUT"],
+        "paired_partition_kind": "PREHOLDOUT",
+        "paired_partition_descriptor_sha256": descriptors["PREHOLDOUT"],
+    }
+    _validate_partition_manifest_schema(locked_manifest)
+    locked_path = _write_partition_manifest(
+        root_path,
+        str(prepared["LOCKED_HOLDOUT"]["stem"]),
+        locked_manifest,
+    )
+    locked_manifest_sha = _sha256(
+        _read_plain_data_bytes(locked_path, "locked partition manifest")
+    )
+    preholdout_manifest = {
+        **base_manifests["PREHOLDOUT"],
+        "partition_descriptor_sha256": descriptors["PREHOLDOUT"],
+        "paired_partition_kind": "LOCKED_HOLDOUT",
+        "paired_partition_descriptor_sha256": descriptors["LOCKED_HOLDOUT"],
+        "locked_holdout_manifest_path": locked_path.relative_to(root_path).as_posix(),
+        "locked_holdout_manifest_sha256": locked_manifest_sha,
+    }
+    _validate_partition_manifest_schema(preholdout_manifest)
+    preholdout_path = _write_partition_manifest(
+        root_path,
+        str(prepared["PREHOLDOUT"]["stem"]),
+        preholdout_manifest,
+    )
+    return preholdout_path, locked_path
 
 
 def load_bars_from_manifest(
-    path: str | Path, root: str | Path = "."
+    path: str | Path,
+    root: str | Path = ".",
+    *,
+    expected_kind: str | None = None,
+    replay_full_parent: bool = False,
+    allow_locked_data: bool = False,
 ) -> tuple[list[Bar], dict[str, Any]]:
     root_path = Path(root).resolve()
-    manifest = verify_manifest(path, root=root_path)
-    normalized_path = root_path / manifest["normalized_path"]
-    bars: list[Bar] = []
-    with normalized_path.open("r", encoding="utf-8", newline="") as handle:
-        for row in csv.DictReader(handle):
-            bars.append(
-                Bar(
-                    open_time_ms=int(row["open_time_ms"]),
-                    open=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
-                    volume=float(row["volume"]),
-                    close_time_ms=int(row["close_time_ms"]),
-                )
-            )
+    manifest = verify_manifest(
+        path,
+        root=root_path,
+        expected_kind=expected_kind,
+        replay_full_parent=replay_full_parent,
+        allow_locked_data=allow_locked_data,
+    )
+    normalized_path = _resolve_plain_file_inside(
+        root_path,
+        str(manifest["normalized_path"]),
+        root_path / "data" / "normalized",
+        "normalized dataset",
+    )
+    payload = _read_plain_data_bytes(normalized_path, "normalized dataset")
+    if _sha256(payload) != manifest["normalized_sha256"]:
+        raise DataIntegrityError("normalized dataset changed after manifest verification")
+    rows = _rows_from_csv(payload)
+    if payload != _csv_bytes(rows):
+        raise DataIntegrityError("normalized dataset changed to non-canonical CSV")
+    bars = [
+        Bar(
+            open_time_ms=int(row[0]),
+            open=float(row[1]),
+            high=float(row[2]),
+            low=float(row[3]),
+            close=float(row[4]),
+            volume=float(row[5]),
+            close_time_ms=int(row[6]),
+            trade_count=int(row[8]),
+        )
+        for row in rows
+    ]
     if manifest.get("gap_policy") == "CARRY_FORWARD_NO_FILL":
         bars = _expand_gaps_carry_forward(bars)
     return bars, manifest
@@ -1123,6 +1506,7 @@ def _expand_gaps_carry_forward(bars: list[Bar]) -> list[Bar]:
                     volume=0.0,
                     close_time_ms=cursor + HOUR_MS - 1,
                     synthetic=True,
+                    trade_count=0,
                 )
             )
             cursor += HOUR_MS

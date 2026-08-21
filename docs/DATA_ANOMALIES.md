@@ -20,8 +20,10 @@ with no quoting and no line terminator. Hash those UTF-8 bytes with SHA-256.
 
 The only admitted simulation treatment is `CARRY_FORWARD_NO_FILL` policy
 version `1.0.0`: missing hours may be represented in memory by a flat synthetic
-bar at the preceding official close, strategy state is frozen, and no fill may
-occur on a synthetic bar. Raw and normalized source data remain unchanged.
+bar at the preceding official close; every indicator, regime, and
+pending-intent state is frozen, and no fill may occur on it. Official
+zero-volume or zero-trade bars have the same state/fill ineligibility without
+being relabelled synthetic. Raw and normalized source data remain unchanged.
 Any additional event, changed row hash, changed source hash, or changed count
 requires a new versioned registry and a new experiment identity.
 
@@ -39,7 +41,9 @@ batch and requires the resulting canonical CSV bytes—not merely parsed
 values—to equal the normalized dataset. Raw batch paths, hashes, boundaries,
 and row counts must also exactly match the registered source manifest, so a
 semantically equivalent but byte-different replacement is still source drift.
-Partition verification independently requires its canonical CSV bytes to equal
-the exact timestamp slice of the verified full-source parent. An unregistered
-event, changed row, noncanonical CSV representation, missing commitment, or
-mismatched partition is rejected as source drift.
+The explicitly isolated provenance replay independently requires each
+partition's canonical CSV bytes to equal its exact timestamp slice of the
+verified full-source parent. Ordinary PRE verification is metadata-only with
+respect to the FULL parent and LOCKED prices. An unregistered event, changed
+row, noncanonical CSV representation, missing commitment, or mismatched
+partition is rejected as source drift.

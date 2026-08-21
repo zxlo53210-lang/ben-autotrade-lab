@@ -4,19 +4,34 @@ import hashlib
 import json
 import math
 import os
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .anchor import read_holdout_opened_anchor, verify_anchor_store
 from .config import LabConfig, canonical_json
 from .integrity import (
+    fsync_directory,
+    is_link_or_reparse,
     is_sha256,
+    require_plain_regular_single_link,
     resolve_regular_file_inside,
     source_tree_sha256,
     verified_hashed_object,
     write_immutable,
+)
+from .validation import (
+    FINALIZED_STATE_FIELDS,
+    FROZEN_STATE_FIELDS,
+    OPENED_STATE_FIELDS,
+    _read_canonical_state,
+    _require_anchor_matches_opened,
+    _require_config_anchor_store_id,
+    _verified_holdout_report_artifact,
+    _verified_selection_artifact,
 )
 
 GENESIS_HASH = "0" * 64
@@ -38,28 +53,62 @@ def _event_hash(event_without_hash: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(event_without_hash)).hexdigest()
 
 
+def _path_present(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _require_paper_file(path: Path, label: str) -> None:
+    try:
+        require_plain_regular_single_link(path, label)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def _require_paper_directory(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{label} is missing") from exc
+    if is_link_or_reparse(path) or not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f"{label} must be a plain directory")
+
+
 def _paper_journal(root: Path) -> Path:
     state_root = root / "state"
     paper_directory = state_root / "paper"
     for directory in (state_root, paper_directory):
-        if directory.exists() and (
-            directory.is_symlink()
-            or (hasattr(directory, "is_junction") and directory.is_junction())
-        ):
+        if is_link_or_reparse(directory):
             raise RuntimeError("paper state directories must not be links or junctions")
         try:
             directory.resolve().relative_to(root)
         except ValueError as exc:
             raise RuntimeError("paper state path escapes the repository") from exc
     journal = paper_directory / "journal.jsonl"
-    if journal.is_symlink():
-        raise RuntimeError("paper journal must not be a symbolic link")
+    if is_link_or_reparse(journal):
+        raise RuntimeError("paper journal must not be a link or reparse point")
     return journal
+
+
+def _flush_paper_directory_chain(journal: Path) -> None:
+    directories = (journal.parent,)
+    if journal.parent.name == "paper" and journal.parent.parent.name == "state":
+        directories = (
+            journal.parent,
+            journal.parent.parent,
+            journal.parent.parent.parent,
+        )
+    for directory in directories:
+        fsync_directory(directory)
 
 
 @contextmanager
 def _single_writer(journal: Path) -> Iterator[None]:
     journal.parent.mkdir(parents=True, exist_ok=True)
+    _flush_paper_directory_chain(journal)
     lock = journal.with_suffix(journal.suffix + ".lock")
     acquired = False
     try:
@@ -67,11 +116,14 @@ def _single_writer(journal: Path) -> Iterator[None]:
             handle.write(str(os.getpid()))
             handle.flush()
             os.fsync(handle.fileno())
+        _require_paper_file(lock, "paper writer lock")
         acquired = True
+        fsync_directory(journal.parent)
         yield
     finally:
         if acquired and lock.exists():
             lock.unlink()
+            fsync_directory(journal.parent)
 
 
 def _head_path(journal: Path) -> Path:
@@ -107,62 +159,112 @@ def _append_event(
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        _require_paper_file(journal, "paper journal")
+        fsync_directory(journal.parent)
         commitment = {
             "sequence": event["sequence"],
             "event_hash": event["event_hash"],
             "previous_hash": event["previous_hash"],
         }
+        commit_directory = _commit_directory(journal)
+        if _path_present(commit_directory):
+            _require_paper_directory(commit_directory, "paper journal commitment store")
+        commit_path = _commit_path(journal, event["sequence"], event["event_hash"])
         write_immutable(
-            _commit_path(journal, event["sequence"], event["event_hash"]),
+            commit_path,
             canonical_json(commitment) + b"\n",
         )
+        _require_paper_directory(commit_directory, "paper journal commitment store")
+        _require_paper_file(commit_path, "paper journal commitment")
+        fsync_directory(journal.parent)
         head = (
             canonical_json({"event_count": len(events) + 1, "event_hash": event["event_hash"]})
             + b"\n"
         )
         head_path = _head_path(journal)
         temporary = head_path.with_name(f".{head_path.name}.{os.getpid()}.tmp")
-        temporary.write_bytes(head)
+        with temporary.open("xb") as handle:
+            handle.write(head)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _require_paper_file(temporary, "paper journal temporary head")
         temporary.replace(head_path)
+        _require_paper_file(head_path, "paper journal head")
+        fsync_directory(journal.parent)
         return event
 
 
 def verify_journal(path: str | Path) -> list[dict[str, Any]]:
     journal = Path(path)
+    if is_link_or_reparse(journal):
+        raise RuntimeError("paper journal must not be a link or reparse point")
     if not journal.exists():
-        head_exists = _head_path(journal).exists()
+        head_path = _head_path(journal)
+        if is_link_or_reparse(head_path):
+            raise RuntimeError("paper journal head commitment is invalid")
+        head_exists = head_path.exists()
         commits = _commit_directory(journal)
+        if _path_present(commits):
+            _require_paper_directory(commits, "paper journal commitment store")
         commits_exist = commits.exists() and any(commits.iterdir())
         if head_exists or commits_exist:
             raise RuntimeError("paper journal is missing but commitments remain")
         return []
+    _require_paper_file(journal, "paper journal")
+    journal_payload = journal.read_bytes()
+    _require_paper_file(journal, "paper journal")
+    if not journal_payload or not journal_payload.endswith(b"\n"):
+        raise RuntimeError("paper journal is not canonical JSONL")
+    lines = journal_payload[:-1].split(b"\n")
+    if any(not line for line in lines):
+        raise RuntimeError("paper journal contains an empty event")
     events: list[dict[str, Any]] = []
     previous = GENESIS_HASH
-    for expected_sequence, line in enumerate(journal.read_bytes().splitlines()):
-        event = json.loads(line)
+    expected_event_fields = {"sequence", "previous_hash", "timestamp_utc", "payload", "event_hash"}
+    for expected_sequence, line in enumerate(lines):
+        try:
+            event = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("paper journal event is not valid UTF-8 JSON") from exc
         if not isinstance(event, dict):
             # This is persisted-journal corruption, not a caller type error.
             raise RuntimeError("paper journal event is not an object")  # noqa: TRY004
-        supplied_hash = event.pop("event_hash", None)
+        if set(event) != expected_event_fields or line != canonical_json(event):
+            raise RuntimeError("paper journal event schema or encoding is not canonical")
+        supplied_hash = event.get("event_hash")
         if not is_sha256(supplied_hash) or not isinstance(event.get("payload"), dict):
             raise RuntimeError("paper journal event shape is invalid")
-        if event.get("sequence") != expected_sequence or event.get("previous_hash") != previous:
+        sequence = event.get("sequence")
+        if (
+            not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence != expected_sequence
+            or event.get("previous_hash") != previous
+        ):
             raise RuntimeError("paper journal sequence or hash chain is invalid")
-        calculated = _event_hash(event)
+        timestamp = event.get("timestamp_utc")
+        if not isinstance(timestamp, str) or not timestamp.endswith("Z"):
+            raise RuntimeError("paper journal timestamp is invalid")
+        try:
+            parsed_timestamp = datetime.fromisoformat(timestamp.removesuffix("Z") + "+00:00")
+        except ValueError as exc:
+            raise RuntimeError("paper journal timestamp is invalid") from exc
+        if parsed_timestamp.utcoffset() != UTC.utcoffset(parsed_timestamp):
+            raise RuntimeError("paper journal timestamp is not UTC")
+        unsigned = {key: value for key, value in event.items() if key != "event_hash"}
+        calculated = _event_hash(unsigned)
         if calculated != supplied_hash:
             raise RuntimeError("paper journal event hash mismatch")
-        event["event_hash"] = supplied_hash
         events.append(event)
         previous = supplied_hash
 
     commit_directory = _commit_directory(journal)
     commitments = []
-    if commit_directory.exists():
-        if commit_directory.is_symlink() or not commit_directory.is_dir():
-            raise RuntimeError("paper journal commitment store is invalid")
+    if _path_present(commit_directory):
+        _require_paper_directory(commit_directory, "paper journal commitment store")
         commitments = sorted(commit_directory.iterdir(), key=lambda item: item.name)
-        if any(path.is_symlink() or not path.is_file() for path in commitments):
-            raise RuntimeError("paper journal commitment store contains an invalid entry")
+        for commitment_path in commitments:
+            _require_paper_file(commitment_path, "paper journal commitment")
     if len(commitments) != len(events):
         raise RuntimeError("paper journal immutable commitment count mismatch")
     for event, commitment_path in zip(events, commitments, strict=True):
@@ -174,32 +276,37 @@ def verify_journal(path: str | Path) -> list[dict[str, Any]]:
             "event_hash": event["event_hash"],
             "previous_hash": event["previous_hash"],
         }
-        if commitment_path.read_bytes() != canonical_json(expected_commitment) + b"\n":
+        commitment_payload = commitment_path.read_bytes()
+        _require_paper_file(commitment_path, "paper journal commitment")
+        if commitment_payload != canonical_json(expected_commitment) + b"\n":
             raise RuntimeError("paper journal immutable commitment mismatch")
 
     head_path = _head_path(journal)
     if events and not head_path.exists():
         raise RuntimeError("paper journal head commitment is missing")
+    if is_link_or_reparse(head_path):
+        raise RuntimeError("paper journal head commitment is invalid")
     if head_path.exists():
-        if head_path.is_symlink() or not head_path.is_file():
-            raise RuntimeError("paper journal head commitment is invalid")
+        _require_paper_file(head_path, "paper journal head commitment")
         head_payload = head_path.read_bytes()
+        _require_paper_file(head_path, "paper journal head commitment")
         head = json.loads(head_payload)
-        if not isinstance(head, dict) or head_payload != canonical_json(head) + b"\n":
+        if (
+            not isinstance(head, dict)
+            or set(head) != {"event_count", "event_hash"}
+            or head_payload != canonical_json(head) + b"\n"
+        ):
             raise RuntimeError("paper journal head commitment is not canonical")
+        head_count = head.get("event_count")
+        if (
+            not isinstance(head_count, int)
+            or isinstance(head_count, bool)
+            or not is_sha256(head.get("event_hash"))
+        ):
+            raise RuntimeError("paper journal head commitment shape is invalid")
         if head.get("event_count") != len(events) or head.get("event_hash") != previous:
             raise RuntimeError("paper journal was truncated or its head is inconsistent")
     return events
-
-
-def _canonical_state(path: Path) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"required provenance state is missing: {path.name}")
-    payload = path.read_bytes()
-    value = json.loads(payload)
-    if not isinstance(value, dict) or payload != canonical_json(value) + b"\n":
-        raise ValueError(f"provenance state is not canonical: {path.name}")
-    return value
 
 
 def _artifact(root: Path, prefix: str, digest: object) -> Path:
@@ -216,8 +323,14 @@ def _require_fields(value: dict[str, Any], expected: dict[str, Any], label: str)
 
 
 def _verified_finalized_report(
-    root: Path, report_path: str | Path, config: LabConfig
+    root: Path,
+    report_path: str | Path,
+    config: LabConfig,
+    *,
+    anchor_root: str | Path,
+    anchor_store_id: str,
 ) -> dict[str, Any]:
+    _require_config_anchor_store_id(config, anchor_store_id)
     supplied_path = Path(report_path)
     if supplied_path.is_absolute():
         try:
@@ -227,20 +340,21 @@ def _verified_finalized_report(
     else:
         relative = supplied_path.as_posix()
     report_file = resolve_regular_file_inside(root, relative, "artifacts")
-    report = verified_hashed_object(report_file, "report_sha256")
+    report = _verified_holdout_report_artifact(report_file)
     if report_file.name != f"holdout-{report['report_sha256'][:16]}.json":
         raise ValueError("paper report filename is not content-addressed")
 
     _require_fields(
         report,
         {
-            "schema_version": "1.1.0",
+            "schema_version": "1.2.0",
             "status": "BACKTEST_CANDIDATE",
             "capability": "LIVE_DISABLED",
             "authority": "RESEARCH_ONLY_ZERO_LIVE_AUTHORITY",
             "profit_claim": "NONE",
             "evaluation_label": "RETROSPECTIVE_LOCKED_OOS",
             "evidence_level": "RETROSPECTIVE_LOCKED_OOS",
+            "report_kind": "LOCKED_OOS_EVALUATION",
             "config_sha256": config.config_sha256,
             "source_tree_sha256": source_tree_sha256(root),
         },
@@ -255,7 +369,7 @@ def _verified_finalized_report(
         raise ValueError("paper report does not contain the exact passing holdout gates")
 
     selection_file = _artifact(root, "selection", report.get("selection_sha256"))
-    selection = verified_hashed_object(selection_file, "selection_sha256")
+    selection = _verified_selection_artifact(selection_file)
     _require_fields(
         selection,
         {
@@ -273,8 +387,8 @@ def _verified_finalized_report(
 
     test_file = _artifact(root, "test-receipt", report.get("test_receipt_sha256"))
     review_file = _artifact(root, "pro-review-receipt", report.get("review_receipt_sha256"))
-    test_receipt = verified_hashed_object(test_file, "receipt_sha256")
-    review_receipt = verified_hashed_object(review_file, "receipt_sha256")
+    test_receipt = verified_hashed_object(test_file, "receipt_sha256", root=root)
+    review_receipt = verified_hashed_object(review_file, "receipt_sha256", root=root)
     receipt_binding = {
         "experiment_id": selection.get("experiment_id"),
         "selection_sha256": selection.get("selection_sha256"),
@@ -288,6 +402,9 @@ def _verified_finalized_report(
         {"type": "TEST_RECEIPT", "status": "PASS", **receipt_binding},
         "test receipt",
     )
+    replay = test_receipt.get("full_provenance_replay")
+    if not isinstance(replay, dict) or replay.get("status") != "PASS":
+        raise ValueError("test receipt full provenance replay is not PASS")
     _require_fields(
         review_receipt,
         {"type": "PRO_REVIEW_RECEIPT", "verdict": "PROCEED", **receipt_binding},
@@ -307,11 +424,27 @@ def _verified_finalized_report(
     except ValueError as exc:
         raise ValueError("paper experiment store escapes the repository") from exc
     experiment = experiments / str(experiment_id)
-    if experiment.is_symlink() or experiment.resolve().parent != experiments.resolve():
+    if (
+        experiment.is_symlink()
+        or (hasattr(experiment, "is_junction") and experiment.is_junction())
+        or experiment.resolve().parent != experiments.resolve()
+    ):
         raise ValueError("paper experiment state path is invalid")
-    frozen = _canonical_state(experiment / "FROZEN.json")
-    opened = _canonical_state(experiment / "HOLDOUT_OPENED.json")
-    finalized = _canonical_state(experiment / "FINALIZED.json")
+    frozen = _read_canonical_state(
+        experiment / "FROZEN.json",
+        expected_state="FROZEN",
+        exact_fields=FROZEN_STATE_FIELDS,
+    )
+    opened = _read_canonical_state(
+        experiment / "HOLDOUT_OPENED.json",
+        expected_state="HOLDOUT_OPENED",
+        exact_fields=OPENED_STATE_FIELDS,
+    )
+    finalized = _read_canonical_state(
+        experiment / "FINALIZED.json",
+        expected_state="FINALIZED",
+        exact_fields=FINALIZED_STATE_FIELDS,
+    )
     _require_fields(
         frozen,
         {
@@ -331,6 +464,7 @@ def _verified_finalized_report(
         {
             "state": "HOLDOUT_OPENED",
             "experiment_id": experiment_id,
+            "previous_state_sha256": frozen["state_sha256"],
             "selection_sha256": selection["selection_sha256"],
             "holdout_manifest_sha256": report.get("holdout_manifest_sha256"),
             "test_receipt_sha256": test_receipt["receipt_sha256"],
@@ -338,11 +472,28 @@ def _verified_finalized_report(
         },
         "HOLDOUT_OPENED state",
     )
+    anchor_store = verify_anchor_store(
+        anchor_root,
+        repository_root=root,
+        expected_store_id=anchor_store_id,
+        expected_store_sha256=str(config.raw["anchor"]["store_sha256"]),
+    )
+    external_anchor = read_holdout_opened_anchor(anchor_store, str(experiment_id))
+    _require_anchor_matches_opened(
+        opened,
+        external_anchor,
+        anchor_store_id=anchor_store.store_id,
+        config_sha256=config.config_sha256,
+        source_tree_sha256_value=selection["source_tree_sha256"],
+        preholdout_data_sha256=selection["preholdout_data_sha256"],
+        holdout_commitment_sha256=selection["holdout_commitment_sha256"],
+    )
     _require_fields(
         finalized,
         {
             "state": "FINALIZED",
             "experiment_id": experiment_id,
+            "previous_state_sha256": opened["state_sha256"],
             "report_path": report_file.relative_to(root).as_posix(),
             "report_sha256": report["report_sha256"],
             "status": "BACKTEST_CANDIDATE",
@@ -357,12 +508,22 @@ def initialize_paper(
     report_path: str | Path,
     config: LabConfig,
     capital: float,
+    *,
+    anchor_root: str | Path,
+    anchor_store_id: str,
 ) -> dict[str, Any]:
     if not math.isfinite(capital) or capital <= 0:
         raise ValueError("paper capital must be finite and positive")
+    _require_config_anchor_store_id(config, anchor_store_id)
     root_path = Path(root).resolve()
     journal = _paper_journal(root_path)
-    report = _verified_finalized_report(root_path, report_path, config)
+    report = _verified_finalized_report(
+        root_path,
+        report_path,
+        config,
+        anchor_root=anchor_root,
+        anchor_store_id=anchor_store_id,
+    )
     event = _append_event(
         journal,
         {

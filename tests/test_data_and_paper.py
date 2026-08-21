@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from test_paper_authorization import _complete_provenance
+from test_paper_authorization import ANCHOR_STORE_ID, _complete_provenance
 
 from ben_trade_lab.config import canonical_json, load_config
 from ben_trade_lab.data import (
@@ -101,9 +101,19 @@ class DataTests(unittest.TestCase):
 
 
 class PaperJournalTests(unittest.TestCase):
-    def _report(self, root: Path, config, status: str = "BACKTEST_CANDIDATE") -> Path:
+    def _report(
+        self,
+        root: Path,
+        config,
+        *,
+        anchor_root: Path,
+        status: str = "BACKTEST_CANDIDATE",
+    ) -> Path:
         if status == "BACKTEST_CANDIDATE":
-            provenance_config, report = _complete_provenance(root)
+            provenance_config, report = _complete_provenance(
+                root,
+                anchor_root=anchor_root,
+            )
             self.assertEqual(provenance_config.config_sha256, config.config_sha256)
             return report
         value = {
@@ -122,9 +132,18 @@ class PaperJournalTests(unittest.TestCase):
     def test_journal_is_hash_chained_and_stoppable(self) -> None:
         config = load_config(ROOT / "configs" / "btcusdt_1h.toml")
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            report = self._report(root, config)
-            initialized = initialize_paper(root, report, config, 1000.0)
+            sandbox = Path(temporary)
+            root = sandbox / "repository"
+            anchor_root = sandbox / "external-anchor"
+            report = self._report(root, config, anchor_root=anchor_root)
+            initialized = initialize_paper(
+                root,
+                report,
+                config,
+                1000.0,
+                anchor_root=anchor_root,
+                anchor_store_id=ANCHOR_STORE_ID,
+            )
             self.assertEqual(initialized["status"], "PAPER_INITIALIZED")
             self.assertEqual(paper_status(root)["event_count"], 1)
             stopped = stop_paper(root)
@@ -137,16 +156,38 @@ class PaperJournalTests(unittest.TestCase):
         config = load_config(ROOT / "configs" / "btcusdt_1h.toml")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            report = self._report(root, config, status="NOT_PROVEN")
+            anchor_root = root / "unused-anchor"
+            report = self._report(
+                root,
+                config,
+                anchor_root=anchor_root,
+                status="NOT_PROVEN",
+            )
             with self.assertRaises(ValueError):
-                initialize_paper(root, report, config, 1000.0)
+                initialize_paper(
+                    root,
+                    report,
+                    config,
+                    1000.0,
+                    anchor_root=anchor_root,
+                    anchor_store_id=ANCHOR_STORE_ID,
+                )
 
     def test_valid_prefix_truncation_is_detected_by_head_commitment(self) -> None:
         config = load_config(ROOT / "configs" / "btcusdt_1h.toml")
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            report = self._report(root, config)
-            initialize_paper(root, report, config, 1000.0)
+            sandbox = Path(temporary)
+            root = sandbox / "repository"
+            anchor_root = sandbox / "external-anchor"
+            report = self._report(root, config, anchor_root=anchor_root)
+            initialize_paper(
+                root,
+                report,
+                config,
+                1000.0,
+                anchor_root=anchor_root,
+                anchor_store_id=ANCHOR_STORE_ID,
+            )
             stop_paper(root)
             journal = root / "state" / "paper" / "journal.jsonl"
             first = journal.read_bytes().splitlines(keepends=True)[0]

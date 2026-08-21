@@ -75,13 +75,21 @@ def build_targets(
         return []
     if not 0 <= evaluation_start_index < len(bars):
         raise ValueError("evaluation_start_index lies outside bars")
-    highs = [bar.high for bar in bars]
-    lows = [bar.low for bar in bars]
-    closes = [bar.close for bar in bars]
+    # Indicator time advances only on official, observed-liquidity bars.  In
+    # particular, a synthetic, zero-volume, or zero-trade bar must neither
+    # enter a rolling buffer nor evict an older eligible observation from one.
+    eligible_indices = [index for index, bar in enumerate(bars) if bar.state_eligible]
+    eligible_bars = [bars[index] for index in eligible_indices]
+    highs = [bar.high for bar in eligible_bars]
+    lows = [bar.low for bar in eligible_bars]
+    closes = [bar.close for bar in eligible_bars]
     entry_levels = _rolling_previous_extreme(highs, params.entry_lookback, maximum=True)
     exit_levels = _rolling_previous_extreme(lows, params.exit_lookback, maximum=False)
     trend_levels = _rolling_mean(closes, params.trend_lookback)
     volatilities = _rolling_realized_volatility(closes, params.volatility_lookback)
+    eligible_ordinal = {
+        bar_index: ordinal for ordinal, bar_index in enumerate(eligible_indices)
+    }
 
     targets: list[float] = []
     is_long = False
@@ -90,13 +98,14 @@ def build_targets(
         if index < evaluation_start_index:
             targets.append(0.0)
             continue
-        if bar.synthetic:
+        if not bar.state_eligible:
             targets.append(entry_exposure if is_long else 0.0)
             continue
-        entry = entry_levels[index]
-        exit_ = exit_levels[index]
-        trend = trend_levels[index]
-        realized_volatility = volatilities[index]
+        ordinal = eligible_ordinal[index]
+        entry = entry_levels[ordinal]
+        exit_ = exit_levels[ordinal]
+        trend = trend_levels[ordinal]
+        realized_volatility = volatilities[ordinal]
         ready = None not in (entry, exit_, trend, realized_volatility)
         if not ready:
             targets.append(0.0)

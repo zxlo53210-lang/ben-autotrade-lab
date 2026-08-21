@@ -6,7 +6,11 @@ import unittest
 from datetime import UTC, datetime
 
 from ben_trade_lab.engine import ExecutionAssumptions, run_backtest
-from ben_trade_lab.metrics import calculate_metrics
+from ben_trade_lab.metrics import (
+    boundary_aware_utc_daily_metrics,
+    buy_and_hold_metrics,
+    calculate_metrics,
+)
 from ben_trade_lab.models import BacktestResult, Bar, EquityPoint, StrategyParams
 from ben_trade_lab.strategy import (
     HOURS_PER_YEAR,
@@ -15,6 +19,7 @@ from ben_trade_lab.strategy import (
     _rolling_realized_volatility,
     build_targets,
 )
+from ben_trade_lab.validation import _fold_metrics_from_continuous, _window_result
 
 HOUR_MS = 3_600_000
 
@@ -36,6 +41,7 @@ def _bar(
         close=close,
         volume=volume,
         close_time_ms=(index + 1) * HOUR_MS - 1,
+        trade_count=1,
     )
 
 
@@ -125,6 +131,32 @@ class SignalSemanticsGoldenTests(unittest.TestCase):
 
 
 class ExecutionCostGoldenTests(unittest.TestCase):
+    def test_buy_and_hold_waits_for_next_eligible_open(self) -> None:
+        bars = [
+            _bar(0, open_=100.0, high=101.0, low=99.0, close=100.0),
+            _bar(
+                1,
+                open_=1_000_000.0,
+                high=1_000_001.0,
+                low=999_999.0,
+                close=1_000_000.0,
+                volume=0.0,
+            ),
+            _bar(2, open_=120.0, high=122.0, low=119.0, close=121.0),
+            _bar(3, open_=129.0, high=131.0, low=128.0, close=130.0),
+        ]
+        assumptions = ExecutionAssumptions(
+            initial_cash=1_000.0,
+            fee_bps_per_side=0.0,
+            slippage_bps_per_side=0.0,
+        )
+        result = run_backtest(bars, [1.0] * len(bars), assumptions)
+        self.assertEqual(len(result.fills), 1)
+        self.assertEqual(result.fills[0].source_signal_index, 0)
+        self.assertEqual(result.fills[0].fill_index, 2)
+        metrics = buy_and_hold_metrics(bars, assumptions)
+        self.assertAlmostEqual(metrics["terminal_equity"], 1_000.0 / 120.0 * 130.0)
+
     @staticmethod
     def _round_trip(multiplier: float):
         bars = [
@@ -193,6 +225,19 @@ class ExecutionCostGoldenTests(unittest.TestCase):
         )
         self.assertTrue(metrics["terminal_liquidation_applied"])
 
+        daily = boundary_aware_utc_daily_metrics(
+            result,
+            boundary_equity=result.initial_cash,
+            terminal_value=metrics["terminal_equity"],
+        )
+        quarter = daily["path"][-1]["quarter_utc"]
+        self.assertAlmostEqual(
+            daily["quarterly_pnl"][quarter],
+            expected_liquidation - result.initial_cash,
+            places=12,
+        )
+        self.assertAlmostEqual(daily["path"][-1]["end_equity"], expected_liquidation, places=12)
+
 
 class MetricGoldenTests(unittest.TestCase):
     def test_utc_daily_sharpe_and_hourly_drawdown_use_different_resolutions(self) -> None:
@@ -208,12 +253,117 @@ class MetricGoldenTests(unittest.TestCase):
             ]
         )
         metrics = calculate_metrics(result)
-        daily_returns = [0.10, -0.10, 0.10]
+        daily_returns = [0.0, 0.10, -0.10, 0.10]
         expected_sharpe = (
             statistics.mean(daily_returns) / statistics.stdev(daily_returns) * math.sqrt(365.25)
         )
         self.assertAlmostEqual(metrics["annualized_sharpe_daily"], expected_sharpe, places=12)
         self.assertAlmostEqual(metrics["maximum_drawdown"], -0.50, places=14)
+
+    def test_first_utc_day_is_included_in_daily_return_path(self) -> None:
+        result = _cash_result(
+            [
+                (_utc_ms(2026, 1, 1), 1_100.0),
+                (_utc_ms(2026, 1, 2), 1_210.0),
+                (_utc_ms(2026, 1, 3), 1_331.0),
+            ]
+        )
+        daily = boundary_aware_utc_daily_metrics(result)
+        self.assertEqual(
+            [point["date_utc"] for point in daily["path"]],
+            [
+                "2026-01-01",
+                "2026-01-02",
+                "2026-01-03",
+            ],
+        )
+        for point in daily["path"]:
+            self.assertAlmostEqual(point["return"], 0.10, places=14)
+
+    def test_first_day_loss_reverses_daily_sharpe_sign(self) -> None:
+        result = _cash_result(
+            [
+                (_utc_ms(2026, 1, 1), 500.0),
+                (_utc_ms(2026, 1, 2), 550.0),
+                (_utc_ms(2026, 1, 3), 600.0),
+            ],
+            initial_cash=1_000.0,
+        )
+        expected_returns = [-0.50, 0.10, 600.0 / 550.0 - 1.0]
+        expected_sharpe = (
+            statistics.mean(expected_returns)
+            / statistics.stdev(expected_returns)
+            * math.sqrt(365.25)
+        )
+        metrics = calculate_metrics(result)
+        self.assertLess(metrics["annualized_sharpe_daily"], 0.0)
+        self.assertAlmostEqual(metrics["annualized_sharpe_daily"], expected_sharpe, places=12)
+
+    def test_first_day_pnl_is_included_in_positive_quarter_concentration(self) -> None:
+        result = _cash_result(
+            [
+                (_utc_ms(2026, 1, 1), 1_100.0),
+                (_utc_ms(2026, 3, 31), 1_200.0),
+                (_utc_ms(2026, 6, 30), 1_400.0),
+            ]
+        )
+        daily = boundary_aware_utc_daily_metrics(result)
+        self.assertAlmostEqual(daily["quarterly_pnl"]["2026-Q1"], 200.0, places=12)
+        self.assertAlmostEqual(daily["quarterly_pnl"]["2026-Q2"], 200.0, places=12)
+        self.assertAlmostEqual(
+            daily["maximum_positive_quarter_mark_to_market_profit_concentration"],
+            0.5,
+            places=14,
+        )
+        self.assertAlmostEqual(
+            calculate_metrics(result)[
+                "maximum_positive_quarter_mark_to_market_profit_concentration"
+            ],
+            0.5,
+            places=14,
+        )
+
+    def test_fold_and_standalone_window_metrics_have_exact_parity(self) -> None:
+        bars = [
+            _bar(
+                index,
+                open_=100.0 + index,
+                high=101.0 + index,
+                low=99.0 + index,
+                close=100.0 + index,
+            )
+            for index in range(74)
+        ]
+        params = StrategyParams(
+            entry_lookback=2,
+            exit_lookback=1,
+            trend_lookback=2,
+            volatility_lookback=2,
+            target_annualized_volatility=0.30,
+            volatility_floor=0.10,
+        )
+        assumptions = ExecutionAssumptions(1_000.0, 10.0, 5.0)
+        start_index = 2
+        start_ms = bars[start_index].open_time_ms
+        end_ms_exclusive = bars[-1].close_time_ms + 1
+        standalone = _window_result(
+            bars,
+            params,
+            assumptions,
+            start_ms,
+            end_ms_exclusive,
+        )
+        targets = build_targets(bars, params, evaluation_start_index=start_index)
+        result = run_backtest(bars[start_index:], targets[start_index:], assumptions)
+        fold = _fold_metrics_from_continuous(
+            result,
+            0,
+            len(result.equity),
+            start_ms,
+            end_ms_exclusive,
+            result.initial_cash,
+        )
+        self.assertEqual(fold, standalone)
 
     def test_positive_quarter_profit_concentration_is_exact(self) -> None:
         result = _cash_result(

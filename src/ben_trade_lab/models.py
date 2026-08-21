@@ -20,6 +20,24 @@ class Bar:
     volume: float
     close_time_ms: int
     synthetic: bool = False
+    trade_count: int = 0
+
+    @property
+    def official(self) -> bool:
+        """Whether the bar came from the official source rather than gap synthesis."""
+
+        return not self.synthetic
+
+    @property
+    def state_eligible(self) -> bool:
+        """Whether this bar may advance strategy or execution state."""
+
+        return (
+            self.official
+            and not self.synthetic
+            and self.volume > 0.0
+            and self.trade_count > 0
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +79,7 @@ class EquityPoint:
     quantity: float
     close: float
     equity: float
+    state_eligible: bool = False
 
 
 @dataclass(frozen=True, slots=True)

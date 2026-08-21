@@ -16,7 +16,10 @@ trading system.
   data. An exchange-source outage may be admitted only when every missing hour
   is recorded in the immutable anomaly ledger and the frozen
   `CARRY_FORWARD_NO_FILL` policy is used: synthetic hours carry the last close,
-  freeze strategy state, and can never execute a fill.
+  freeze every strategy indicator/regime/pending-intent state, and can never
+  execute a fill. Official zero-volume or zero-trade bars have the same frozen
+  state and no-fill semantics. Only an official, non-synthetic bar with both
+  positive volume and positive trade count is strategy-state/fill eligible.
 - Backtests must declare fees and slippage and retain the data/config/code
   fingerprint used to produce every result.
 - Acceptance thresholds are fixed before the locked holdout is opened. A failed
@@ -30,4 +33,5 @@ trading system.
   defaults, and non-deterministic output as P0/P1 defects.
 - Treat any live-order or secret-bearing capability as a P0 defect.
 - Require tests for cash/position conservation, long-or-cash limits,
-  deterministic fingerprints, and backtest/paper parity.
+  deterministic fingerprints, boundary-aware first-day metrics, authenticated
+  one-shot state receipts, and backtest/paper parity.

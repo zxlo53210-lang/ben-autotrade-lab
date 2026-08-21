@@ -1,5 +1,5 @@
 [project]
-contract_version = "1.1.0"
+contract_version = "1.2.0"
 status = "RESEARCH_NOT_YET_VALIDATED"
 
 [market]
@@ -27,9 +27,9 @@ maximum_gross_exposure = 1.0
 allow_short = false
 allow_leverage = false
 signal_fill_delay_bars = 1
-fill_eligibility = "OFFICIAL_POSITIVE_VOLUME_ONLY"
-unfilled_intent_policy = "DEFER_UNTIL_NEXT_ELIGIBLE_OR_CANCEL"
-terminal_valuation = "LIQUIDATE_AT_FINAL_CLOSE_WITH_COSTS"
+fill_eligibility = "OFFICIAL_POSITIVE_VOLUME_AND_TRADE_COUNT"
+unfilled_intent_policy = "DEFER_THROUGH_INELIGIBLE_UNTIL_ELIGIBLE_FILL_OR_ELIGIBLE_CANCEL"
+terminal_valuation = "LIQUIDATE_AT_FINAL_ELIGIBLE_CLOSE_WITH_COSTS_ELSE_NOT_PROVEN"
 
 [strategy]
 family = "DONCHIAN_TREND_VOL_TARGET"
@@ -65,6 +65,11 @@ moving_block_bootstrap_resamples = 2000
 moving_block_length_days = 7
 latency_stress_delay_bars = 2
 seed_policy = "SHA256_EXPERIMENT_ID"
+
+[anchor]
+store_id = "64acdb6e068cd88f1db2045ebf0dd2f6d93c6710b338f2b4e4898c927e4ef47e"
+store_sha256 = "0f12006fa9f7d5137faa77f694b59bce4afe34899f93ca9785d1ab923ab1a995"
+policy = "CREATE_ONLY_PER_EXPERIMENT_HASH_CHAIN_V1"
 
 [paper]
 minimum_calendar_days = 180

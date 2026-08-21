@@ -2,27 +2,524 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import math
 import statistics
-from collections import OrderedDict, defaultdict
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .anchor import (
+    OPENED_STATE_BASE_FIELDS,
+    ExternalAnchorNotFound,
+    assert_holdout_unopened,
+    commit_holdout_opened_anchor,
+    read_holdout_opened_anchor,
+    verify_anchor_store,
+)
 from .config import LabConfig, canonical_json, parse_utc_ms
 from .data import HOUR_MS, bind_manifest_to_config, load_bars_from_manifest, read_manifest_metadata
 from .diagnostics import moving_block_max_sharpe
 from .engine import ExecutionAssumptions, run_backtest
-from .integrity import source_tree_sha256, verified_hashed_object, write_exclusive, write_immutable
-from .metrics import buy_and_hold_metrics, calculate_metrics
+from .integrity import (
+    fsync_directory,
+    is_link_or_reparse,
+    require_plain_regular_single_link,
+    source_tree_sha256,
+    verified_hashed_object,
+    write_exclusive,
+    write_immutable,
+)
+from .metrics import (
+    TerminalLiquidationNotExecutable,
+    boundary_aware_utc_daily_metrics,
+    buy_and_hold_metrics,
+    calculate_metrics,
+)
 from .models import BacktestResult, Bar, StrategyParams
 from .strategy import build_targets
 
 PREHOLDOUT_FOLD_COUNT = 9
 MAX_HOLDOUT_CONTEXT_HOURS = 720
-VALIDATION_METHOD = "CONTINUOUS_NINE_FOLD_VALIDATION_V1"
+SELECTION_SCHEMA_VERSION = "1.2.0"
+HOLDOUT_REPORT_SCHEMA_VERSION = "1.2.0"
+VALIDATION_METHOD = "CONTINUOUS_NINE_FOLD_VALIDATION_V2"
 HOLDOUT_EVALUATION_LABEL = "RETROSPECTIVE_LOCKED_OOS"
+REPORT_KIND_LOCKED_OOS_EVALUATION = "LOCKED_OOS_EVALUATION"
+REPORT_KIND_TERMINAL_LIQUIDATION_FAILURE = "TERMINAL_LIQUIDATION_FAILURE"
+BENCHMARK_PROTOCOL = (
+    "FIRST_ELIGIBLE_OOS_CLOSE_SIGNAL_NEXT_ELIGIBLE_OOS_OPEN_FILL_"
+    "BASE_COSTS_FINAL_ELIGIBLE_CLOSE_LIQUIDATION_V1"
+)
+
+SELECTION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "status",
+        "authority",
+        "method",
+        "experiment_id",
+        "preholdout_manifest_path",
+        "preholdout_manifest_sha256",
+        "preholdout_partition_descriptor_sha256",
+        "locked_holdout_manifest_path",
+        "locked_holdout_manifest_sha256",
+        "locked_partition_descriptor_sha256",
+        "preholdout_data_sha256",
+        "parent_manifest_sha256",
+        "holdout_commitment_sha256",
+        "lockbox_id",
+        "config_sha256",
+        "source_tree_sha256",
+        "trial_count",
+        "fold_count",
+        "fold_protocol",
+        "selected_params",
+        "selection_objective",
+        "selection_bias_diagnostic",
+        "parameter_adjacency_edges",
+        "selected_parameter_neighbors",
+        "preholdout_neighbor_count",
+        "preholdout_neighbor_positive_fraction",
+        "warmup_context_hours",
+        "warmup_context",
+        "candidates",
+        "selection_sha256",
+    }
+)
+HOLDOUT_REPORT_COMMON_FIELDS = frozenset(
+    {
+        "schema_version",
+        "report_kind",
+        "status",
+        "capability",
+        "authority",
+        "profit_claim",
+        "evaluation_label",
+        "evidence_level",
+        "experiment_id",
+        "selection_sha256",
+        "holdout_manifest_sha256",
+        "holdout_data_sha256",
+        "config_sha256",
+        "source_tree_sha256",
+        "test_receipt_sha256",
+        "review_receipt_sha256",
+        "selected_params",
+        "gates",
+        "report_sha256",
+    }
+)
+HOLDOUT_SUCCESS_REPORT_FIELDS = HOLDOUT_REPORT_COMMON_FIELDS | frozenset(
+    {
+        "holdout",
+        "metrics",
+        "benchmark_protocol",
+        "benchmark_buy_and_hold",
+        "cost_stress",
+        "latency_stress",
+        "preholdout_parameter_neighbor_fraction",
+        "holdout_parameter_neighbors",
+        "holdout_parameter_neighbor_protocol",
+        "holdout_parameter_neighbor_positive_fraction",
+        "holdout_gap_events",
+        "holdout_missing_hours",
+    }
+)
+HOLDOUT_FAILURE_REPORT_FIELDS = HOLDOUT_REPORT_COMMON_FIELDS | frozenset(
+    {"failure_reason", "metrics"}
+)
+
+
+def _report_fields_for_kind(value: dict[str, Any]) -> frozenset[str]:
+    """Return the one exact schema permitted for a report kind/status pair."""
+
+    report_kind = value.get("report_kind")
+    status = value.get("status")
+    if report_kind == REPORT_KIND_LOCKED_OOS_EVALUATION:
+        if status not in {"BACKTEST_CANDIDATE", "NOT_PROVEN"}:
+            raise ValueError("locked OOS evaluation report status is invalid")
+        return HOLDOUT_SUCCESS_REPORT_FIELDS
+    if report_kind == REPORT_KIND_TERMINAL_LIQUIDATION_FAILURE:
+        if status != "NOT_PROVEN":
+            raise ValueError("terminal-liquidation failure report must be NOT_PROVEN")
+        return HOLDOUT_FAILURE_REPORT_FIELDS
+    raise ValueError("holdout report kind is invalid")
+
+FROZEN_STATE_FIELDS = frozenset(
+    {
+        "state",
+        "experiment_id",
+        "selection_path",
+        "selection_sha256",
+        "config_sha256",
+        "source_tree_sha256",
+        "preholdout_data_sha256",
+        "holdout_commitment_sha256",
+        "state_sha256",
+    }
+)
+OPENED_STATE_FIELDS = frozenset(
+    {
+        "state",
+        "experiment_id",
+        "previous_state_sha256",
+        "selection_sha256",
+        "holdout_manifest_sha256",
+        "test_receipt_sha256",
+        "review_receipt_sha256",
+        "opened_at_utc",
+        "external_anchor_store_id",
+        "external_anchor_sha256",
+        "state_sha256",
+    }
+)
+FINALIZED_STATE_FIELDS = frozenset(
+    {
+        "state",
+        "experiment_id",
+        "previous_state_sha256",
+        "report_path",
+        "report_sha256",
+        "status",
+        "state_sha256",
+    }
+)
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _experiment_id(
+    *,
+    method_version: str,
+    config_sha256: str,
+    source_tree_sha256_value: str,
+    lockbox_id: str,
+    preholdout_data_sha256: str,
+    holdout_commitment_sha256: str,
+    selected_params: dict[str, Any] | None,
+) -> str:
+    identity = {
+        "method_version": method_version,
+        "config_sha256": config_sha256,
+        "source_tree_sha256": source_tree_sha256_value,
+        "lockbox_id": lockbox_id,
+        "preholdout_data_sha256": preholdout_data_sha256,
+        "holdout_commitment_sha256": holdout_commitment_sha256,
+        "selected_params": selected_params,
+    }
+    return hashlib.sha256(canonical_json(identity)).hexdigest()
+
+
+def _require_selection_experiment_identity(selection: dict[str, Any]) -> None:
+    expected = _experiment_id(
+        method_version=str(selection.get("method")),
+        config_sha256=str(selection.get("config_sha256")),
+        source_tree_sha256_value=str(selection.get("source_tree_sha256")),
+        lockbox_id=str(selection.get("lockbox_id")),
+        preholdout_data_sha256=str(selection.get("preholdout_data_sha256")),
+        holdout_commitment_sha256=str(selection.get("holdout_commitment_sha256")),
+        selected_params=selection.get("selected_params"),
+    )
+    if selection.get("experiment_id") != expected:
+        raise ValueError("selection experiment identity mismatch")
+
+
+def _with_state_sha256(unsigned: dict[str, Any]) -> dict[str, Any]:
+    if "state_sha256" in unsigned:
+        raise ValueError("state hash input must be unsigned")
+    value = dict(unsigned)
+    value["state_sha256"] = hashlib.sha256(canonical_json(unsigned)).hexdigest()
+    return value
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    return is_link_or_reparse(path)
+
+
+def _path_entry_exists(path: Path) -> bool:
+    """Return true for every directory entry, including dangling reparses."""
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _reject_state_path_links(path: Path) -> None:
+    for candidate in (path, path.parent, path.parent.parent, path.parent.parent.parent):
+        if _is_link_or_junction(candidate):
+            raise ValueError("state path must not contain links or junctions")
+
+
+def _read_canonical_state(
+    path: Path,
+    *,
+    expected_state: str,
+    exact_fields: frozenset[str],
+) -> dict[str, Any]:
+    _reject_state_path_links(path)
+    try:
+        require_plain_regular_single_link(path, f"{expected_state} state")
+    except ValueError as exc:
+        if path.exists() or is_link_or_reparse(path):
+            raise
+        raise RuntimeError(f"experiment has no {expected_state} receipt") from exc
+    payload = path.read_bytes()
+    require_plain_regular_single_link(path, f"{expected_state} state")
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{expected_state} state is not canonical JSON") from exc
+    if not isinstance(value, dict):
+        raise TypeError(f"{expected_state} state must be a JSON object")
+    if payload != canonical_json(value) + b"\n":
+        raise ValueError(f"{expected_state} state is not canonical JSON")
+    if set(value) != exact_fields:
+        raise ValueError(f"{expected_state} state schema mismatch")
+    if value.get("state") != expected_state:
+        raise ValueError(f"{expected_state} state discriminator mismatch")
+    if not _is_sha256(value.get("experiment_id")):
+        raise ValueError(f"{expected_state} experiment_id is malformed")
+    for field in exact_fields:
+        if field.endswith("_sha256") and not _is_sha256(value.get(field)):
+            raise ValueError(f"{expected_state} {field} is malformed")
+    for field in ("selection_path", "report_path"):
+        if field not in exact_fields:
+            continue
+        bound_path = value.get(field)
+        if (
+            not isinstance(bound_path, str)
+            or not bound_path
+            or "\\" in bound_path
+            or Path(bound_path).is_absolute()
+            or ".." in Path(bound_path).parts
+        ):
+            raise ValueError(f"{expected_state} {field} is malformed")
+    if expected_state == "HOLDOUT_OPENED":
+        if not _is_sha256(value.get("external_anchor_store_id")):
+            raise ValueError("HOLDOUT_OPENED external_anchor_store_id is malformed")
+        opened_at = value.get("opened_at_utc")
+        if not isinstance(opened_at, str) or not opened_at.endswith("Z"):
+            raise ValueError("HOLDOUT_OPENED opened_at_utc is malformed")
+        try:
+            parsed_opened_at = datetime.fromisoformat(opened_at.removesuffix("Z") + "+00:00")
+        except ValueError as exc:
+            raise ValueError("HOLDOUT_OPENED opened_at_utc is malformed") from exc
+        if parsed_opened_at.utcoffset() != UTC.utcoffset(parsed_opened_at):
+            raise ValueError("HOLDOUT_OPENED opened_at_utc is not UTC")
+    supplied = value.get("state_sha256")
+    if not _is_sha256(supplied):
+        raise ValueError(f"{expected_state} state_sha256 is malformed")
+    unsigned = {key: item for key, item in value.items() if key != "state_sha256"}
+    if hashlib.sha256(canonical_json(unsigned)).hexdigest() != supplied:
+        raise ValueError(f"{expected_state} state_sha256 mismatch")
+    return value
+
+
+def _fsync_parent_directory(directory: Path) -> None:
+    """Compatibility wrapper retained for targeted failure-injection tests."""
+
+    fsync_directory(directory)
+
+
+def _write_state_exclusive(path: Path, unsigned: dict[str, Any]) -> dict[str, Any]:
+    _reject_state_path_links(path)
+    value = _with_state_sha256(unsigned)
+    write_exclusive(path, value)
+    _reject_state_path_links(path)
+    for directory in (
+        path.parent,
+        path.parent.parent,
+        path.parent.parent.parent,
+        path.parent.parent.parent.parent,
+    ):
+        _fsync_parent_directory(directory)
+    return value
+
+
+def _root_relative_file(path: str | Path, root: Path, label: str) -> tuple[Path, str]:
+    unresolved = Path(path)
+    if not unresolved.is_absolute():
+        unresolved = root / unresolved
+    require_plain_regular_single_link(unresolved, label)
+    resolved = unresolved.resolve()
+    try:
+        relative = resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"{label} must stay inside the repository") from exc
+    candidate = root
+    for part in Path(relative).parts:
+        candidate /= part
+        if _is_link_or_junction(candidate):
+            raise ValueError(f"{label} must not contain links or junctions")
+    require_plain_regular_single_link(resolved, label)
+    return resolved, relative
+
+
+def _require_exact_state_binding(
+    actual: dict[str, Any], expected: dict[str, Any], label: str
+) -> None:
+    if set(actual) != set(expected):
+        raise ValueError(f"{label} state schema mismatch")
+    for field, expected_value in expected.items():
+        if actual.get(field) != expected_value:
+            raise ValueError(f"{label} state {field} mismatch")
+
+
+def _verified_exact_hashed_artifact(
+    path: str | Path,
+    hash_field: str,
+    *,
+    exact_fields: frozenset[str],
+    schema_version: str,
+    label: str,
+    root: str | Path | None = None,
+) -> dict[str, Any]:
+    artifact_path = Path(path).resolve()
+    value = verified_hashed_object(artifact_path, hash_field, root=root)
+    if artifact_path.read_bytes() != canonical_json(value) + b"\n":
+        raise ValueError(f"{label} is not canonical JSON")
+    if set(value) != exact_fields:
+        raise ValueError(f"{label} schema mismatch")
+    if value.get("schema_version") != schema_version:
+        raise ValueError(f"{label} schema version mismatch")
+    for field in exact_fields:
+        if field.endswith("_sha256") and not _is_sha256(value.get(field)):
+            raise ValueError(f"{label} {field} is malformed")
+    return value
+
+
+def _verified_selection_artifact(
+    path: str | Path,
+    *,
+    root: str | Path | None = None,
+) -> dict[str, Any]:
+    selection = _verified_exact_hashed_artifact(
+        path,
+        "selection_sha256",
+        exact_fields=SELECTION_FIELDS,
+        schema_version=SELECTION_SCHEMA_VERSION,
+        label="selection",
+        root=root,
+    )
+    if selection.get("method") != VALIDATION_METHOD:
+        raise ValueError("selection validation method mismatch")
+    for field in ("preholdout_manifest_path", "locked_holdout_manifest_path"):
+        value = selection.get(field)
+        if (
+            not isinstance(value, str)
+            or not value.startswith("data/manifests/")
+            or not value.endswith(".json")
+            or "\\" in value
+            or Path(value).is_absolute()
+            or any(part in {"", ".", ".."} for part in Path(value).parts)
+            or Path(value).as_posix() != value
+        ):
+            raise ValueError(f"selection {field} is malformed")
+    if (
+        selection["preholdout_manifest_path"]
+        == selection["locked_holdout_manifest_path"]
+    ):
+        raise ValueError("selection partition manifest paths must be distinct")
+    if (
+        selection["preholdout_partition_descriptor_sha256"]
+        == selection["locked_partition_descriptor_sha256"]
+    ):
+        raise ValueError("selection partition descriptors must be distinct")
+    _require_selection_experiment_identity(selection)
+    return selection
+
+
+def _load_selection_artifact(
+    path: str | Path,
+    root: str | Path,
+) -> tuple[dict[str, Any], Path, str]:
+    root_path = Path(root).resolve()
+    selection_file, selection_relative = _root_relative_file(
+        path, root_path, "selection path"
+    )
+    selection = _verified_selection_artifact(selection_file)
+    if selection_file.parent != (root_path / "artifacts").resolve():
+        raise ValueError("selection must be stored directly inside artifacts")
+    if selection_file.name != f"selection-{selection['selection_sha256'][:16]}.json":
+        raise ValueError("selection filename is not content-addressed")
+    return selection, selection_file, selection_relative
+
+
+def _verified_holdout_report_artifact(
+    path: str | Path,
+    *,
+    root: str | Path | None = None,
+) -> dict[str, Any]:
+    artifact_path = Path(path).resolve()
+    value = verified_hashed_object(artifact_path, "report_sha256", root=root)
+    exact_fields = _report_fields_for_kind(value)
+    if artifact_path.read_bytes() != canonical_json(value) + b"\n":
+        raise ValueError("holdout report is not canonical JSON")
+    if set(value) != exact_fields:
+        raise ValueError("holdout report schema mismatch")
+    if value.get("schema_version") != HOLDOUT_REPORT_SCHEMA_VERSION:
+        raise ValueError("holdout report schema version mismatch")
+    for field in exact_fields:
+        if field.endswith("_sha256") and not _is_sha256(value.get(field)):
+            raise ValueError(f"holdout report {field} is malformed")
+    return value
+
+
+def _opened_state_base(opened: dict[str, Any]) -> dict[str, Any]:
+    return {field: opened[field] for field in sorted(OPENED_STATE_BASE_FIELDS)}
+
+
+def _require_anchor_matches_opened(
+    opened: dict[str, Any],
+    anchor: dict[str, Any],
+    *,
+    anchor_store_id: str,
+    config_sha256: str,
+    source_tree_sha256_value: str,
+    preholdout_data_sha256: str,
+    holdout_commitment_sha256: str,
+) -> None:
+    opened_base = _opened_state_base(opened)
+    expected = {
+        "anchor_store_id": anchor_store_id,
+        "experiment_id": opened["experiment_id"],
+        "opened_at_utc": opened["opened_at_utc"],
+        "opened_state_base_sha256": hashlib.sha256(canonical_json(opened_base)).hexdigest(),
+        "previous_state_sha256": opened["previous_state_sha256"],
+        "selection_sha256": opened["selection_sha256"],
+        "config_sha256": config_sha256,
+        "source_tree_sha256": source_tree_sha256_value,
+        "preholdout_data_sha256": preholdout_data_sha256,
+        "holdout_commitment_sha256": holdout_commitment_sha256,
+        "holdout_manifest_sha256": opened["holdout_manifest_sha256"],
+        "test_receipt_sha256": opened["test_receipt_sha256"],
+        "review_receipt_sha256": opened["review_receipt_sha256"],
+        "authority": "RESEARCH_ONLY_ZERO_LIVE_AUTHORITY",
+        "capability": "LIVE_DISABLED",
+    }
+    if opened.get("external_anchor_store_id") != anchor_store_id:
+        raise ValueError("HOLDOUT_OPENED external_anchor_store_id mismatch")
+    if opened.get("external_anchor_sha256") != anchor.get("anchor_sha256"):
+        raise ValueError("HOLDOUT_OPENED external_anchor_sha256 mismatch")
+    for field, expected_value in expected.items():
+        if anchor.get(field) != expected_value:
+            raise ValueError(f"external HOLDOUT_OPENED anchor {field} mismatch")
+
+
+def _require_config_anchor_store_id(config: LabConfig, expected_store_id: str) -> None:
+    configured = config.raw.get("anchor")
+    if not isinstance(configured, dict) or configured.get("store_id") != expected_store_id:
+        raise ValueError("external anchor store id does not match the frozen config")
 
 
 def _source_tree_sha256(root: Path) -> str:
@@ -165,13 +662,6 @@ def _window_result(
     return _apply_exact_window_duration(metrics, start_ms, end_ms_exclusive)
 
 
-def _sample_sharpe(returns: Sequence[float]) -> float:
-    if len(returns) < 2:
-        return 0.0
-    deviation = statistics.stdev(returns)
-    return 0.0 if deviation == 0 else statistics.mean(returns) / deviation * math.sqrt(365.25)
-
-
 def _fold_metrics_from_continuous(
     result: BacktestResult,
     start_index: int,
@@ -204,57 +694,7 @@ def _fold_metrics_from_continuous(
         slippage_bps_per_side=result.slippage_bps_per_side,
     )
     metrics = calculate_metrics(fold_result)
-    terminal = float(metrics["terminal_equity"])
-    elapsed_years = max(
-        (end_ms_exclusive - start_ms) / (1000 * 60 * 60 * 24 * 365.25),
-        1.0 / 365.25,
-    )
-    cagr = (terminal / boundary_equity) ** (1.0 / elapsed_years) - 1.0
-
-    peak = boundary_equity
-    maximum_drawdown = 0.0
-    for index, point in enumerate(points):
-        value = terminal if index == len(points) - 1 else point.equity
-        peak = max(peak, value)
-        maximum_drawdown = min(maximum_drawdown, value / peak - 1.0)
-    calmar = cagr / abs(maximum_drawdown) if maximum_drawdown < 0 else None
-
-    daily: OrderedDict[str, tuple[datetime, float]] = OrderedDict()
-    for index, point in enumerate(points):
-        moment = datetime.fromtimestamp(point.open_time_ms / 1000, tz=UTC)
-        value = terminal if index == len(points) - 1 else point.equity
-        daily[moment.date().isoformat()] = (moment, value)
-    daily_returns: list[float] = []
-    quarterly_pnl: dict[str, float] = defaultdict(float)
-    previous_equity = boundary_equity
-    for moment, equity in daily.values():
-        daily_returns.append(equity / previous_equity - 1.0)
-        quarter = (moment.month - 1) // 3 + 1
-        quarterly_pnl[f"{moment.year}-Q{quarter}"] += equity - previous_equity
-        previous_equity = equity
-    sharpe = _sample_sharpe(daily_returns)
-    downside = [min(0.0, value) for value in daily_returns]
-    downside_deviation = statistics.stdev(downside) if len(downside) >= 2 else 0.0
-    sortino = (
-        statistics.mean(daily_returns) / downside_deviation * math.sqrt(365.25)
-        if downside_deviation > 0
-        else 0.0
-    )
-    positive_quarters = [value for value in quarterly_pnl.values() if value > 0]
-    concentration = max(positive_quarters) / sum(positive_quarters) if positive_quarters else 1.0
-    metrics.update(
-        {
-            "elapsed_hours": (end_ms_exclusive - start_ms) / HOUR_MS,
-            "total_return": terminal / boundary_equity - 1.0,
-            "cagr": cagr,
-            "annualized_sharpe_daily": sharpe,
-            "annualized_sortino_daily": sortino,
-            "maximum_drawdown": maximum_drawdown,
-            "calmar": calmar,
-            "maximum_positive_quarter_mark_to_market_profit_concentration": concentration,
-        }
-    )
-    return metrics
+    return _apply_exact_window_duration(metrics, start_ms, end_ms_exclusive)
 
 
 def _continuous_validation_result(
@@ -346,18 +786,12 @@ def _continuous_daily_returns(result: BacktestResult) -> list[dict[str, Any]]:
     """Return aligned UTC close-to-close returns for selection-bias diagnostics."""
 
     metrics = calculate_metrics(result)
-    terminal_value = float(metrics["terminal_equity"])
-    daily: OrderedDict[str, float] = OrderedDict()
-    for index, point in enumerate(result.equity):
-        moment = datetime.fromtimestamp(point.open_time_ms / 1000, tz=UTC)
-        value = terminal_value if index == len(result.equity) - 1 else point.equity
-        daily[moment.date().isoformat()] = value
-    previous = result.initial_cash
-    returns: list[dict[str, Any]] = []
-    for date_utc, equity in daily.items():
-        returns.append({"date_utc": date_utc, "return": equity / previous - 1.0})
-        previous = equity
-    return returns
+    daily = boundary_aware_utc_daily_metrics(
+        result,
+        boundary_equity=result.initial_cash,
+        terminal_value=float(metrics["terminal_equity"]),
+    )
+    return [{"date_utc": point["date_utc"], "return": point["return"]} for point in daily["path"]]
 
 
 def _select_primary_candidate(
@@ -398,6 +832,7 @@ def _serialize_bar(bar: Bar) -> dict[str, Any]:
         "volume": bar.volume,
         "close_time_ms": bar.close_time_ms,
         "synthetic": bar.synthetic,
+        "trade_count": bar.trade_count,
     }
 
 
@@ -411,6 +846,7 @@ def _deserialize_bar(value: dict[str, Any]) -> Bar:
         volume=float(value["volume"]),
         close_time_ms=int(value["close_time_ms"]),
         synthetic=bool(value["synthetic"]),
+        trade_count=int(value["trade_count"]),
     )
 
 
@@ -458,6 +894,34 @@ def select_candidate(
 ) -> Path:
     root_path = Path(root).resolve()
     bind_manifest_to_config(manifest, config, "PREHOLDOUT")
+    if manifest.get("paired_partition_kind") != "LOCKED_HOLDOUT":
+        raise ValueError("pre-holdout manifest paired kind mismatch")
+    partition_bindings = {
+        "preholdout_manifest_path": manifest.get("manifest_path"),
+        "preholdout_manifest_sha256": manifest.get("manifest_file_sha256"),
+        "preholdout_partition_descriptor_sha256": manifest.get(
+            "partition_descriptor_sha256"
+        ),
+        "locked_holdout_manifest_path": manifest.get("locked_holdout_manifest_path"),
+        "locked_holdout_manifest_sha256": manifest.get(
+            "locked_holdout_manifest_sha256"
+        ),
+        "locked_partition_descriptor_sha256": manifest.get(
+            "paired_partition_descriptor_sha256"
+        ),
+    }
+    for field, value in partition_bindings.items():
+        if field.endswith("_sha256") and not _is_sha256(value):
+            raise ValueError(f"pre-holdout manifest {field} is malformed")
+    for field in ("preholdout_manifest_path", "locked_holdout_manifest_path"):
+        value = partition_bindings[field]
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"pre-holdout manifest {field} is malformed")
+    if (
+        partition_bindings["preholdout_partition_descriptor_sha256"]
+        == partition_bindings["locked_partition_descriptor_sha256"]
+    ):
+        raise ValueError("pre-holdout manifest partition descriptors must be distinct")
     holdout_start = parse_utc_ms(config.splits["validation_end_utc_exclusive"])
     if bars[0].open_time_ms != int(manifest["requested_start_ms"]):
         raise ValueError("pre-holdout first bar does not match manifest")
@@ -529,16 +993,15 @@ def select_candidate(
     if len(context) != max_warmup or context[-1].open_time_ms != holdout_start - HOUR_MS:
         raise ValueError("pre-holdout indicator context is incomplete")
     source_sha = source_tree_sha256(root_path)
-    identity = {
-        "method_version": VALIDATION_METHOD,
-        "config_sha256": config.config_sha256,
-        "source_tree_sha256": source_sha,
-        "lockbox_id": manifest["lockbox_id"],
-        "preholdout_data_sha256": manifest["normalized_sha256"],
-        "holdout_commitment_sha256": manifest["holdout_commitment_sha256"],
-        "selected_params": selected_params,
-    }
-    experiment_id = hashlib.sha256(canonical_json(identity)).hexdigest()
+    experiment_id = _experiment_id(
+        method_version=VALIDATION_METHOD,
+        config_sha256=config.config_sha256,
+        source_tree_sha256_value=source_sha,
+        lockbox_id=manifest["lockbox_id"],
+        preholdout_data_sha256=manifest["normalized_sha256"],
+        holdout_commitment_sha256=manifest["holdout_commitment_sha256"],
+        selected_params=selected_params,
+    )
     selection_bias_diagnostic: dict[str, Any] | None = None
     if selected_item is not None:
         diagnostics = config.raw["diagnostics"]
@@ -563,12 +1026,12 @@ def select_candidate(
             seed_hex=experiment_id,
         )
     selection = {
-        "schema_version": "1.1.0",
+        "schema_version": SELECTION_SCHEMA_VERSION,
         "status": "FROZEN_CANDIDATE" if selected_item else "NO_ELIGIBLE_CANDIDATE",
         "authority": "RESEARCH_ONLY_ZERO_LIVE_AUTHORITY",
         "method": VALIDATION_METHOD,
         "experiment_id": experiment_id,
-        "preholdout_manifest_sha256": manifest["manifest_file_sha256"],
+        **partition_bindings,
         "preholdout_data_sha256": manifest["normalized_sha256"],
         "parent_manifest_sha256": manifest["parent_manifest_sha256"],
         "holdout_commitment_sha256": manifest["holdout_commitment_sha256"],
@@ -602,6 +1065,8 @@ def select_candidate(
     selection["selection_sha256"] = hashlib.sha256(canonical_json(selection)).hexdigest()
     path = root_path / "artifacts" / f"selection-{selection['selection_sha256'][:16]}.json"
     write_immutable(path, canonical_json(selection) + b"\n")
+    _fsync_parent_directory(path.parent)
+    _fsync_parent_directory(root_path)
     frozen = {
         "state": "FROZEN",
         "experiment_id": experiment_id,
@@ -612,17 +1077,21 @@ def select_candidate(
         "preholdout_data_sha256": manifest["normalized_sha256"],
         "holdout_commitment_sha256": manifest["holdout_commitment_sha256"],
     }
-    write_immutable(
+    _write_state_exclusive(
         root_path / "state" / "experiments" / experiment_id / "FROZEN.json",
-        canonical_json(frozen) + b"\n",
+        frozen,
     )
     return path
 
 
 def _require_receipt(
-    path: str | Path, selection: dict[str, Any], expected_type: str
+    path: str | Path,
+    selection: dict[str, Any],
+    expected_type: str,
+    root: Path,
 ) -> dict[str, Any]:
-    receipt = verified_hashed_object(path, "receipt_sha256")
+    receipt_file, _ = _root_relative_file(path, root, f"{expected_type} receipt path")
+    receipt = verified_hashed_object(receipt_file, "receipt_sha256", root=root)
     exact = {
         "type": expected_type,
         "experiment_id": selection["experiment_id"],
@@ -635,11 +1104,95 @@ def _require_receipt(
     for field, expected in exact.items():
         if receipt.get(field) != expected:
             raise ValueError(f"{expected_type} receipt {field} mismatch")
-    if expected_type == "TEST_RECEIPT" and receipt.get("status") != "PASS":
-        raise ValueError("test receipt is not PASS")
+    if expected_type == "TEST_RECEIPT":
+        if receipt.get("status") != "PASS":
+            raise ValueError("test receipt is not PASS")
+        replay = receipt.get("full_provenance_replay")
+        if not isinstance(replay, dict) or replay.get("status") != "PASS":
+            raise ValueError("isolated full provenance replay is not PASS")
     if expected_type == "PRO_REVIEW_RECEIPT" and receipt.get("verdict") != "PROCEED":
         raise ValueError("Pro review did not authorize holdout finalization")
     return receipt
+
+
+def _commit_final_report(
+    *,
+    root: Path,
+    experiment_id: str,
+    opened_state_sha256: str,
+    finalized_path: Path,
+    report: dict[str, Any],
+) -> Path:
+    if "report_sha256" in report:
+        raise ValueError("final report must be unsigned before commit")
+    exact_fields = _report_fields_for_kind(report)
+    if set(report) != exact_fields - {"report_sha256"}:
+        raise ValueError("final report schema does not match its report kind")
+    if report.get("schema_version") != HOLDOUT_REPORT_SCHEMA_VERSION:
+        raise ValueError("final report schema version mismatch")
+    committed = dict(report)
+    committed["report_sha256"] = hashlib.sha256(canonical_json(report)).hexdigest()
+    report_path = root / "artifacts" / f"holdout-{committed['report_sha256'][:16]}.json"
+    write_immutable(report_path, canonical_json(committed) + b"\n")
+    _fsync_parent_directory(report_path.parent)
+    _fsync_parent_directory(root)
+    _write_state_exclusive(
+        finalized_path,
+        {
+            "state": "FINALIZED",
+            "experiment_id": experiment_id,
+            "previous_state_sha256": opened_state_sha256,
+            "report_path": report_path.relative_to(root).as_posix(),
+            "report_sha256": committed["report_sha256"],
+            "status": committed["status"],
+        },
+    )
+    return report_path
+
+
+def _terminal_liquidation_failure_report(
+    *,
+    root: Path,
+    config: LabConfig,
+    selection: dict[str, Any],
+    holdout_manifest: dict[str, Any],
+    test_receipt: dict[str, Any],
+    review_receipt: dict[str, Any],
+    opened: dict[str, Any],
+    finalized_path: Path,
+    reason: str,
+) -> Path:
+    if reason != TerminalLiquidationNotExecutable.code:
+        raise ValueError("unexpected terminal-liquidation failure reason")
+    report = {
+        "schema_version": HOLDOUT_REPORT_SCHEMA_VERSION,
+        "report_kind": REPORT_KIND_TERMINAL_LIQUIDATION_FAILURE,
+        "status": "NOT_PROVEN",
+        "capability": "LIVE_DISABLED",
+        "authority": "RESEARCH_ONLY_ZERO_LIVE_AUTHORITY",
+        "profit_claim": "NONE",
+        "evaluation_label": HOLDOUT_EVALUATION_LABEL,
+        "evidence_level": HOLDOUT_EVALUATION_LABEL,
+        "experiment_id": selection["experiment_id"],
+        "selection_sha256": selection["selection_sha256"],
+        "holdout_manifest_sha256": holdout_manifest["manifest_file_sha256"],
+        "holdout_data_sha256": holdout_manifest["normalized_sha256"],
+        "config_sha256": config.config_sha256,
+        "source_tree_sha256": selection["source_tree_sha256"],
+        "test_receipt_sha256": test_receipt["receipt_sha256"],
+        "review_receipt_sha256": review_receipt["receipt_sha256"],
+        "selected_params": selection["selected_params"],
+        "failure_reason": reason,
+        "metrics": None,
+        "gates": {"terminal_liquidation_executable": False},
+    }
+    return _commit_final_report(
+        root=root,
+        experiment_id=selection["experiment_id"],
+        opened_state_sha256=opened["state_sha256"],
+        finalized_path=finalized_path,
+        report=report,
+    )
 
 
 def finalize_holdout(
@@ -648,19 +1201,62 @@ def finalize_holdout(
     selection_path: str | Path,
     test_receipt_path: str | Path,
     review_receipt_path: str | Path,
+    *,
+    anchor_root: str | Path,
+    anchor_store_id: str,
     root: str | Path = ".",
 ) -> Path:
+    _require_config_anchor_store_id(config, anchor_store_id)
     root_path = Path(root).resolve()
-    selection = verified_hashed_object(selection_path, "selection_sha256")
+    selection, _, selection_relative = _load_selection_artifact(
+        selection_path, root_path
+    )
     if selection.get("status") != "FROZEN_CANDIDATE":
         raise ValueError("selection has no eligible frozen candidate")
+    for field in (
+        "experiment_id",
+        "selection_sha256",
+        "config_sha256",
+        "source_tree_sha256",
+        "preholdout_data_sha256",
+        "holdout_commitment_sha256",
+    ):
+        if not _is_sha256(selection.get(field)):
+            raise ValueError(f"selection {field} is malformed")
     if selection["config_sha256"] != config.config_sha256:
         raise ValueError("selection is bound to a different config")
     if selection["source_tree_sha256"] != source_tree_sha256(root_path):
         raise ValueError("source tree changed after candidate selection")
+    experiment_dir = root_path / "state" / "experiments" / selection["experiment_id"]
+    frozen_path = experiment_dir / "FROZEN.json"
+    frozen = _read_canonical_state(
+        frozen_path,
+        expected_state="FROZEN",
+        exact_fields=FROZEN_STATE_FIELDS,
+    )
+    expected_frozen = _with_state_sha256(
+        {
+            "state": "FROZEN",
+            "experiment_id": selection["experiment_id"],
+            "selection_path": selection_relative,
+            "selection_sha256": selection["selection_sha256"],
+            "config_sha256": config.config_sha256,
+            "source_tree_sha256": selection["source_tree_sha256"],
+            "preholdout_data_sha256": selection["preholdout_data_sha256"],
+            "holdout_commitment_sha256": selection["holdout_commitment_sha256"],
+        }
+    )
+    _require_exact_state_binding(frozen, expected_frozen, "FROZEN")
     metadata = read_manifest_metadata(holdout_manifest_path, root=root_path)
     bind_manifest_to_config(metadata, config, "LOCKED_HOLDOUT")
     exact_manifest = {
+        "manifest_path": selection["locked_holdout_manifest_path"],
+        "manifest_file_sha256": selection["locked_holdout_manifest_sha256"],
+        "partition_descriptor_sha256": selection["locked_partition_descriptor_sha256"],
+        "paired_partition_kind": "PREHOLDOUT",
+        "paired_partition_descriptor_sha256": selection[
+            "preholdout_partition_descriptor_sha256"
+        ],
         "lockbox_id": selection["lockbox_id"],
         "normalized_sha256": selection["holdout_commitment_sha256"],
         "preholdout_sha256": selection["preholdout_data_sha256"],
@@ -698,69 +1294,220 @@ def finalize_holdout(
         raise ValueError("frozen selected-candidate adjacency set mismatch")
     if len({canonical_json(value) for value in frozen_neighbors}) != len(frozen_neighbors):
         raise ValueError("frozen selected-candidate adjacency set contains duplicates")
-    test_receipt = _require_receipt(test_receipt_path, selection, "TEST_RECEIPT")
-    review_receipt = _require_receipt(review_receipt_path, selection, "PRO_REVIEW_RECEIPT")
-    experiment_dir = root_path / "state" / "experiments" / selection["experiment_id"]
-    if not (experiment_dir / "FROZEN.json").exists():
-        raise RuntimeError("experiment has no FROZEN receipt")
+    test_receipt = _require_receipt(test_receipt_path, selection, "TEST_RECEIPT", root_path)
+    review_receipt = _require_receipt(
+        review_receipt_path,
+        selection,
+        "PRO_REVIEW_RECEIPT",
+        root_path,
+    )
     opened_path = experiment_dir / "HOLDOUT_OPENED.json"
     finalized_path = experiment_dir / "FINALIZED.json"
-    if opened_path.exists() or finalized_path.exists():
-        raise RuntimeError("HOLDOUT_ALREADY_OPENED_NOT_RETRYABLE")
-    opened = {
+    opened_commitments = {
         "state": "HOLDOUT_OPENED",
         "experiment_id": selection["experiment_id"],
+        "previous_state_sha256": frozen["state_sha256"],
         "selection_sha256": selection["selection_sha256"],
         "holdout_manifest_sha256": metadata["manifest_file_sha256"],
         "test_receipt_sha256": test_receipt["receipt_sha256"],
         "review_receipt_sha256": review_receipt["receipt_sha256"],
-        "opened_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     }
-    write_exclusive(opened_path, opened)
+    anchor_store = verify_anchor_store(
+        anchor_root,
+        repository_root=root_path,
+        expected_store_id=anchor_store_id,
+        expected_store_sha256=str(config.raw["anchor"]["store_sha256"]),
+    )
+    try:
+        existing_anchor = read_holdout_opened_anchor(
+            anchor_store,
+            selection["experiment_id"],
+        )
+    except ExternalAnchorNotFound:
+        existing_anchor = None
 
-    holdout_bars, holdout_manifest = load_bars_from_manifest(holdout_manifest_path, root=root_path)
+    opened_present = _path_entry_exists(opened_path)
+    finalized_present = _path_entry_exists(finalized_path)
+    if opened_present:
+        existing_opened = _read_canonical_state(
+            opened_path,
+            expected_state="HOLDOUT_OPENED",
+            exact_fields=OPENED_STATE_FIELDS,
+        )
+        for field, expected in opened_commitments.items():
+            if existing_opened.get(field) != expected:
+                raise ValueError(f"HOLDOUT_OPENED state {field} mismatch")
+        if existing_anchor is None:
+            raise RuntimeError("LOCAL_HOLDOUT_OPENED_WITHOUT_EXTERNAL_ANCHOR_NOT_RETRYABLE")
+        _require_anchor_matches_opened(
+            existing_opened,
+            existing_anchor,
+            anchor_store_id=anchor_store.store_id,
+            config_sha256=config.config_sha256,
+            source_tree_sha256_value=selection["source_tree_sha256"],
+            preholdout_data_sha256=selection["preholdout_data_sha256"],
+            holdout_commitment_sha256=selection["holdout_commitment_sha256"],
+        )
+        if finalized_present:
+            existing_finalized = _read_canonical_state(
+                finalized_path,
+                expected_state="FINALIZED",
+                exact_fields=FINALIZED_STATE_FIELDS,
+            )
+            if existing_finalized["experiment_id"] != selection["experiment_id"]:
+                raise ValueError("FINALIZED state experiment_id mismatch")
+            if existing_finalized["previous_state_sha256"] != existing_opened["state_sha256"]:
+                raise ValueError("FINALIZED state previous_state_sha256 mismatch")
+            report_file, report_relative = _root_relative_file(
+                existing_finalized["report_path"], root_path, "finalized report path"
+            )
+            existing_report = _verified_holdout_report_artifact(report_file)
+            if existing_finalized["report_path"] != report_relative:
+                raise ValueError("FINALIZED state report_path mismatch")
+            if existing_finalized["report_sha256"] != existing_report["report_sha256"]:
+                raise ValueError("FINALIZED state report_sha256 mismatch")
+            if existing_finalized["status"] != existing_report.get("status"):
+                raise ValueError("FINALIZED state status mismatch")
+            expected_report_bindings = {
+                "experiment_id": selection["experiment_id"],
+                "selection_sha256": selection["selection_sha256"],
+                "holdout_manifest_sha256": metadata["manifest_file_sha256"],
+                "holdout_data_sha256": selection["holdout_commitment_sha256"],
+                "config_sha256": config.config_sha256,
+                "source_tree_sha256": selection["source_tree_sha256"],
+                "test_receipt_sha256": test_receipt["receipt_sha256"],
+                "review_receipt_sha256": review_receipt["receipt_sha256"],
+                "evaluation_label": HOLDOUT_EVALUATION_LABEL,
+                "evidence_level": HOLDOUT_EVALUATION_LABEL,
+                "authority": "RESEARCH_ONLY_ZERO_LIVE_AUTHORITY",
+                "capability": "LIVE_DISABLED",
+                "profit_claim": "NONE",
+            }
+            for field, expected in expected_report_bindings.items():
+                if existing_report.get(field) != expected:
+                    raise ValueError(f"finalized report {field} mismatch")
+        raise RuntimeError("HOLDOUT_ALREADY_OPENED_NOT_RETRYABLE")
+    if existing_anchor is not None:
+        raise RuntimeError("EXTERNAL_HOLDOUT_OPENED_WITHOUT_LOCAL_STATE_NOT_RETRYABLE")
+    if finalized_present:
+        raise ValueError("FINALIZED state exists without HOLDOUT_OPENED")
+    assert_holdout_unopened(anchor_store, selection["experiment_id"])
+    opened_at_utc = datetime.now(UTC).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+    opened_base = {
+        **opened_commitments,
+        "opened_at_utc": opened_at_utc,
+    }
+    external_anchor = commit_holdout_opened_anchor(
+        anchor_store,
+        opened_state_base=opened_base,
+        config_sha256=config.config_sha256,
+        source_tree_sha256=selection["source_tree_sha256"],
+        preholdout_data_sha256=selection["preholdout_data_sha256"],
+        holdout_commitment_sha256=selection["holdout_commitment_sha256"],
+    )
+    _write_state_exclusive(
+        opened_path,
+        {
+            **opened_base,
+            "external_anchor_store_id": anchor_store.store_id,
+            "external_anchor_sha256": external_anchor["anchor_sha256"],
+        },
+    )
+    opened = _read_canonical_state(
+        opened_path,
+        expected_state="HOLDOUT_OPENED",
+        exact_fields=OPENED_STATE_FIELDS,
+    )
+    external_anchor = read_holdout_opened_anchor(
+        anchor_store,
+        selection["experiment_id"],
+    )
+    _require_anchor_matches_opened(
+        opened,
+        external_anchor,
+        anchor_store_id=anchor_store.store_id,
+        config_sha256=config.config_sha256,
+        source_tree_sha256_value=selection["source_tree_sha256"],
+        preholdout_data_sha256=selection["preholdout_data_sha256"],
+        holdout_commitment_sha256=selection["holdout_commitment_sha256"],
+    )
+
+    holdout_bars, holdout_manifest = load_bars_from_manifest(
+        holdout_manifest_path,
+        root=root_path,
+        expected_kind="LOCKED_HOLDOUT",
+        allow_locked_data=True,
+    )
     bind_manifest_to_config(holdout_manifest, config, "LOCKED_HOLDOUT")
     bars = context + holdout_bars
-    base = _window_result(bars, selected, _assumptions(config), holdout_start, holdout_end)
-    required_multiplier = float(config.acceptance["minimum_positive_cost_stress_multiplier"])
-    required_stress = _window_result(
-        bars, selected, _assumptions(config, required_multiplier), holdout_start, holdout_end
-    )
-    stress_3x = _window_result(
-        bars, selected, _assumptions(config, 3.0), holdout_start, holdout_end
-    )
-    latency_delay = int(config.raw["diagnostics"]["latency_stress_delay_bars"])
-    latency_stress = _window_result(
-        bars,
-        selected,
-        _assumptions(config, signal_delay_bars=latency_delay),
-        holdout_start,
-        holdout_end,
-    )
-    holdout_neighbors = [
-        {
-            "params": value,
-            "metrics": _window_result(
-                bars,
-                _params(value),
-                _assumptions(config),
-                holdout_start,
-                holdout_end,
-            ),
-        }
-        for value in frozen_neighbors
-    ]
+    try:
+        base = _window_result(bars, selected, _assumptions(config), holdout_start, holdout_end)
+        required_multiplier = float(config.acceptance["minimum_positive_cost_stress_multiplier"])
+        required_stress = _window_result(
+            bars, selected, _assumptions(config, required_multiplier), holdout_start, holdout_end
+        )
+        stress_3x = _window_result(
+            bars, selected, _assumptions(config, 3.0), holdout_start, holdout_end
+        )
+        latency_delay = int(config.raw["diagnostics"]["latency_stress_delay_bars"])
+        latency_stress = _window_result(
+            bars,
+            selected,
+            _assumptions(config, signal_delay_bars=latency_delay),
+            holdout_start,
+            holdout_end,
+        )
+        holdout_neighbors = [
+            {
+                "params": value,
+                "metrics": _window_result(
+                    bars,
+                    _params(value),
+                    _assumptions(config),
+                    holdout_start,
+                    holdout_end,
+                ),
+            }
+            for value in frozen_neighbors
+        ]
+    except TerminalLiquidationNotExecutable as exc:
+        return _terminal_liquidation_failure_report(
+            root=root_path,
+            config=config,
+            selection=selection,
+            holdout_manifest=holdout_manifest,
+            test_receipt=test_receipt,
+            review_receipt=review_receipt,
+            opened=opened,
+            finalized_path=finalized_path,
+            reason=exc.code,
+        )
     holdout_neighbor_positive_fraction = (
         sum(item["metrics"]["total_return"] > 0 for item in holdout_neighbors)
         / len(holdout_neighbors)
         if holdout_neighbors
         else 0.0
     )
-    benchmark = _apply_exact_window_duration(
-        buy_and_hold_metrics(holdout_bars, _assumptions(config)),
-        holdout_start,
-        holdout_end,
-    )
+    try:
+        benchmark = _apply_exact_window_duration(
+            buy_and_hold_metrics(holdout_bars, _assumptions(config)),
+            holdout_start,
+            holdout_end,
+        )
+    except TerminalLiquidationNotExecutable as exc:
+        return _terminal_liquidation_failure_report(
+            root=root_path,
+            config=config,
+            selection=selection,
+            holdout_manifest=holdout_manifest,
+            test_receipt=test_receipt,
+            review_receipt=review_receipt,
+            opened=opened,
+            finalized_path=finalized_path,
+            reason=exc.code,
+        )
     acceptance = config.acceptance
     selected_preholdout = next(
         item for item in selection["candidates"] if item["params"] == selection["selected_params"]
@@ -793,7 +1540,8 @@ def finalize_holdout(
         if item.get("type") == "MISSING_HOURLY_BARS"
     ]
     report = {
-        "schema_version": "1.1.0",
+        "schema_version": HOLDOUT_REPORT_SCHEMA_VERSION,
+        "report_kind": REPORT_KIND_LOCKED_OOS_EVALUATION,
         "status": status,
         "capability": "LIVE_DISABLED",
         "authority": "RESEARCH_ONLY_ZERO_LIVE_AUTHORITY",
@@ -817,6 +1565,7 @@ def finalize_holdout(
             "indicator_context_hours": _strategy_warmup_hours(selected),
         },
         "metrics": base,
+        "benchmark_protocol": BENCHMARK_PROTOCOL,
         "benchmark_buy_and_hold": benchmark,
         "cost_stress": {f"{required_multiplier:g}x": required_stress, "3x": stress_3x},
         "latency_stress": {
@@ -837,15 +1586,10 @@ def finalize_holdout(
         "holdout_missing_hours": sum(int(item["missing_bar_count"]) for item in gap_events),
         "gates": gates,
     }
-    report["report_sha256"] = hashlib.sha256(canonical_json(report)).hexdigest()
-    report_path = root_path / "artifacts" / f"holdout-{report['report_sha256'][:16]}.json"
-    write_immutable(report_path, canonical_json(report) + b"\n")
-    finalized = {
-        "state": "FINALIZED",
-        "experiment_id": selection["experiment_id"],
-        "report_path": report_path.relative_to(root_path).as_posix(),
-        "report_sha256": report["report_sha256"],
-        "status": status,
-    }
-    write_exclusive(finalized_path, finalized)
-    return report_path
+    return _commit_final_report(
+        root=root_path,
+        experiment_id=selection["experiment_id"],
+        opened_state_sha256=opened["state_sha256"],
+        finalized_path=finalized_path,
+        report=report,
+    )

@@ -9,6 +9,7 @@ from unittest.mock import patch
 from ben_trade_lab.config import canonical_json
 from ben_trade_lab.engine import ExecutionAssumptions
 from ben_trade_lab.models import Bar, StrategyParams
+from ben_trade_lab.strategy import build_targets
 from ben_trade_lab.validation import (
     HOLDOUT_EVALUATION_LABEL,
     _assumptions,
@@ -26,15 +27,24 @@ def _utc_ms(value: str) -> int:
     return int(datetime.fromisoformat(value).astimezone(UTC).timestamp() * 1000)
 
 
-def _bar(index: int, price: float = 100.0) -> Bar:
+def _bar(
+    index: int,
+    price: float = 100.0,
+    *,
+    volume: float = 10.0,
+    trade_count: int = 1,
+    synthetic: bool = False,
+) -> Bar:
     return Bar(
         open_time_ms=index * HOUR_MS,
         open=price,
         high=price + 1.0,
         low=price - 1.0,
         close=price,
-        volume=10.0,
+        volume=volume,
         close_time_ms=(index + 1) * HOUR_MS - 1,
+        synthetic=synthetic,
+        trade_count=trade_count,
     )
 
 
@@ -167,6 +177,47 @@ class HoldoutProtocolTests(unittest.TestCase):
                 721 * HOUR_MS,
                 723 * HOUR_MS,
             )
+
+    def test_720_hour_context_does_not_backfill_ineligible_warmup_rows(self) -> None:
+        params = _params(720)
+        bars = [_bar(index, 100.0 + 2.0 * index) for index in range(724)]
+        bars[100] = _bar(100, 1_000_000.0, synthetic=True)
+        bars[200] = _bar(200, 1_000_000.0, volume=0.0)
+        bars[300] = _bar(300, 1_000_000.0, trade_count=0)
+        captured: dict[str, object] = {}
+
+        def capture_targets(
+            history: list[Bar],
+            supplied_params: StrategyParams,
+            *,
+            evaluation_start_index: int,
+        ) -> list[float]:
+            captured["history"] = history
+            captured["evaluation_start_index"] = evaluation_start_index
+            targets = build_targets(
+                history,
+                supplied_params,
+                evaluation_start_index=evaluation_start_index,
+            )
+            captured["targets"] = targets
+            return targets
+
+        with patch("ben_trade_lab.validation.build_targets", side_effect=capture_targets):
+            metrics = _window_result(
+                bars,
+                params,
+                ExecutionAssumptions(1_000.0, 10.0, 5.0),
+                720 * HOUR_MS,
+                724 * HOUR_MS,
+            )
+
+        self.assertEqual(len(captured["history"]), 724)
+        self.assertEqual(captured["evaluation_start_index"], 720)
+        targets = captured["targets"]
+        assert isinstance(targets, list)
+        self.assertEqual(targets[720:723], [0.0, 0.0, 0.0])
+        self.assertGreater(targets[723], 0.0)
+        self.assertEqual(metrics["equity_points"], 4)
 
     def test_retrospective_oos_label_is_explicit(self) -> None:
         self.assertEqual(HOLDOUT_EVALUATION_LABEL, "RETROSPECTIVE_LOCKED_OOS")

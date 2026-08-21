@@ -7,17 +7,25 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import __version__
+from .anchor import verify_anchor_store
 from .audit import create_pro_review_receipt, create_test_receipt
 from .config import load_config
 from .data import (
+    DataIntegrityError,
     bind_manifest_to_config,
     fetch_klines,
     load_bars_from_manifest,
     partition_lockbox,
+    read_manifest_metadata,
     verify_manifest,
 )
+from .integrity import verified_hashed_object
 from .paper import initialize_paper, paper_status, stop_paper
-from .validation import finalize_holdout, select_candidate
+from .validation import (
+    _require_config_anchor_store_id,
+    finalize_holdout,
+    select_candidate,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -26,6 +34,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="configs/btcusdt_1h.toml")
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("doctor")
+
+    anchor = subcommands.add_parser("anchor")
+    anchor_commands = anchor.add_subparsers(dest="anchor_command", required=True)
+    anchor_verify = anchor_commands.add_parser("verify")
+    anchor_verify.add_argument("--anchor-root", required=True)
+    anchor_verify.add_argument("--anchor-store-id", required=True)
 
     data = subcommands.add_parser("data")
     data_commands = data.add_subparsers(dest="data_command", required=True)
@@ -44,6 +58,8 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--selection", required=True)
     finalize.add_argument("--test-receipt", required=True)
     finalize.add_argument("--review-receipt", required=True)
+    finalize.add_argument("--anchor-root", required=True)
+    finalize.add_argument("--anchor-store-id", required=True)
 
     audit = subcommands.add_parser("audit")
     audit_commands = audit.add_subparsers(dest="audit_command", required=True)
@@ -61,6 +77,8 @@ def _parser() -> argparse.ArgumentParser:
     init = paper_commands.add_parser("init")
     init.add_argument("--report", required=True)
     init.add_argument("--capital", type=float, default=1000.0)
+    init.add_argument("--anchor-root", required=True)
+    init.add_argument("--anchor-store-id", required=True)
     paper_commands.add_parser("status")
     paper_commands.add_parser("stop")
     paper_commands.add_parser("run-once")
@@ -92,6 +110,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not config_path.is_absolute():
         config_path = root / config_path
     config = load_config(config_path)
+
+    if args.command == "anchor":
+        configured_store_id = str(config.raw["anchor"]["store_id"])
+        _require_config_anchor_store_id(config, args.anchor_store_id)
+        store = verify_anchor_store(
+            args.anchor_root,
+            repository_root=root,
+            expected_store_id=configured_store_id,
+            expected_store_sha256=str(config.raw["anchor"]["store_sha256"]),
+        )
+        _emit(
+            {
+                "status": "ANCHOR_STORE_VERIFIED",
+                "anchor_root": str(store.root),
+                "anchor_store_id": store.store_id,
+            }
+        )
+        return 0
 
     if args.command == "doctor":
         _emit(
@@ -132,7 +168,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "research":
         if args.research_command == "select":
-            bars, manifest = load_bars_from_manifest(args.manifest, root=root)
+            preflight = read_manifest_metadata(args.manifest, root=root)
+            bind_manifest_to_config(preflight, config, "PREHOLDOUT")
+            bars, manifest = load_bars_from_manifest(
+                args.manifest,
+                root=root,
+                expected_kind="PREHOLDOUT",
+            )
+            if manifest["manifest_file_sha256"] != preflight["manifest_file_sha256"]:
+                raise DataIntegrityError("preholdout manifest changed after metadata preflight")
+            if (
+                manifest.get("partition_descriptor_sha256")
+                != preflight.get("partition_descriptor_sha256")
+            ):
+                raise DataIntegrityError(
+                    "preholdout partition descriptor changed after metadata preflight"
+                )
             artifact = select_candidate(bars, manifest, config, root=root)
         else:
             artifact = finalize_holdout(
@@ -141,14 +192,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.selection,
                 args.test_receipt,
                 args.review_receipt,
+                anchor_root=args.anchor_root,
+                anchor_store_id=args.anchor_store_id,
                 root=root,
             )
         _emit({"status": "PASS", "artifact": str(artifact)})
         return 0
     if args.command == "audit" and args.audit_command == "tests":
         artifact = create_test_receipt(root, args.selection, config)
-        _emit({"status": "PASS", "artifact": str(artifact)})
-        return 0
+        receipt = verified_hashed_object(artifact, "receipt_sha256", root=root)
+        replay = receipt.get("full_provenance_replay")
+        authorized = (
+            receipt.get("status") == "PASS"
+            and isinstance(replay, dict)
+            and replay.get("status") == "PASS"
+        )
+        _emit(
+            {
+                "status": "PASS" if authorized else "BLOCKED",
+                "artifact": str(artifact),
+                "full_provenance_replay": replay,
+            }
+        )
+        return 0 if authorized else 3
     if args.command == "audit" and args.audit_command == "record-pro-review":
         artifact = create_pro_review_receipt(
             root,
@@ -162,7 +228,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         _emit({"status": "PASS", "artifact": str(artifact)})
         return 0
     if args.command == "paper" and args.paper_command == "init":
-        _emit(initialize_paper(root, args.report, config, args.capital))
+        _emit(
+            initialize_paper(
+                root,
+                args.report,
+                config,
+                args.capital,
+                anchor_root=args.anchor_root,
+                anchor_store_id=args.anchor_store_id,
+            )
+        )
         return 0
     if args.command == "paper" and args.paper_command == "status":
         _emit(paper_status(root))

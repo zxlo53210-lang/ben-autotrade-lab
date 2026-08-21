@@ -56,26 +56,33 @@ def run_backtest(
     fills: list[Fill] = []
     equity: list[EquityPoint] = []
     pending: _PendingIntent | None = None
+    next_signal_index = 0
 
     for index, bar in enumerate(bars):
         # A close-derived target becomes actionable only at the following bar.
-        # If an older intent is still pending, the newest closed-bar signal can
-        # cancel it by returning to the portfolio's current regime.  Otherwise
-        # the original intent (including its source index and size) survives.
-        if index >= assumptions.signal_delay_bars:
-            signal_index = index - assumptions.signal_delay_bars
-            newest_target = targets[signal_index]
-            current_is_long = quantity > 0.0
-            newest_is_long = newest_target > 0.0
-            if pending is not None and newest_is_long == current_is_long:
-                pending = None
-            elif pending is None and newest_is_long != current_is_long:
-                pending = _PendingIntent(
-                    target=newest_target,
-                    source_signal_index=signal_index,
-                )
+        # State-ineligible bars cannot create, cancel, or resize an intent.  We
+        # therefore consume all matured *eligible-source* signals only when an
+        # eligible execution bar arrives.  This also preserves the source index
+        # and size of an older signal across an arbitrary ineligible run.
+        executable = bar.state_eligible
+        if executable:
+            latest_matured_signal = index - assumptions.signal_delay_bars
+            while next_signal_index <= latest_matured_signal:
+                signal_index = next_signal_index
+                next_signal_index += 1
+                if not bars[signal_index].state_eligible:
+                    continue
+                newest_target = targets[signal_index]
+                current_is_long = quantity > 0.0
+                newest_is_long = newest_target > 0.0
+                if pending is not None and newest_is_long == current_is_long:
+                    pending = None
+                elif pending is None and newest_is_long != current_is_long:
+                    pending = _PendingIntent(
+                        target=newest_target,
+                        source_signal_index=signal_index,
+                    )
 
-        executable = not bar.synthetic and bar.volume > 0.0
         if executable and pending is not None and pending.target > 0.0 and quantity == 0.0:
             execution_price = bar.open * (1.0 + slippage_rate)
             budget = cash * pending.target
@@ -131,6 +138,7 @@ def run_backtest(
                 quantity=quantity,
                 close=bar.close,
                 equity=marked_equity,
+                state_eligible=bar.state_eligible,
             )
         )
 

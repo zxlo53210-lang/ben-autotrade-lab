@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ben-autotrade-lab"
-version = "0.1.0"
+version = "0.2.0"
 description = "Deterministic research and paper-trading laboratory with no live execution path"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,7 +14,7 @@ authors = [{ name = "Ben AutoTrade Lab contributors" }]
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/as889645-sketch/ben-autotrade-lab"
+Repository = "https://github.com/zxlo53210-lang/ben-autotrade-lab"
 
 [project.scripts]
 ben-trade = "ben_trade_lab.cli:main"
