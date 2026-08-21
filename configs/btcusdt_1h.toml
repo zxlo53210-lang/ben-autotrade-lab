@@ -1,0 +1,72 @@
+[project]
+contract_version = "1.1.0"
+status = "RESEARCH_NOT_YET_VALIDATED"
+
+[market]
+venue = "BINANCE_SPOT"
+symbol = "BTCUSDT"
+interval = "1h"
+timezone = "UTC"
+source_base_url = "https://data-api.binance.vision"
+gap_policy = "CARRY_FORWARD_NO_FILL"
+exception_registry_path = "configs/data_exceptions_v1.json"
+exception_registry_sha256 = "5d45208bf3ca72d38b92b671694c74921c5a3ee3ddbae850b30ee7893ca0a582"
+start_utc = "2017-08-17T04:00:00Z"
+end_utc_exclusive = "2026-08-01T00:00:00Z"
+
+[splits]
+development_end_utc_exclusive = "2022-01-01T00:00:00Z"
+validation_end_utc_exclusive = "2024-08-01T00:00:00Z"
+locked_holdout_end_utc_exclusive = "2026-08-01T00:00:00Z"
+
+[execution]
+initial_cash = 10000.0
+fee_bps_per_side = 10.0
+slippage_bps_per_side = 5.0
+maximum_gross_exposure = 1.0
+allow_short = false
+allow_leverage = false
+signal_fill_delay_bars = 1
+fill_eligibility = "OFFICIAL_POSITIVE_VOLUME_ONLY"
+unfilled_intent_policy = "DEFER_UNTIL_NEXT_ELIGIBLE_OR_CANCEL"
+terminal_valuation = "LIQUIDATE_AT_FINAL_CLOSE_WITH_COSTS"
+
+[strategy]
+family = "DONCHIAN_TREND_VOL_TARGET"
+entry_lookbacks = [72, 168, 336]
+exit_lookbacks = [24, 72, 168]
+trend_lookbacks = [336, 720]
+volatility_lookback = 720
+target_annualized_volatility = 0.30
+volatility_floor = 0.10
+
+[selection]
+objective = "MEDIAN_WALK_FORWARD_CALMAR"
+minimum_fold_months = 6
+scoring_start_utc = "2020-02-01T00:00:00Z"
+expected_fold_count = 9
+minimum_positive_fold_fraction = 0.75
+minimum_fold_completed_round_trips = 2
+minimum_fold_exposure_fraction = 0.05
+maximum_fold_exposure_fraction = 0.95
+maximum_trials = 16
+
+[acceptance]
+minimum_holdout_sharpe = 0.80
+minimum_holdout_calmar = 0.75
+maximum_holdout_drawdown = 0.25
+minimum_completed_round_trips = 30
+minimum_positive_cost_stress_multiplier = 2.0
+minimum_positive_parameter_neighbors_fraction = 0.70
+maximum_single_quarter_profit_concentration = 0.50
+
+[diagnostics]
+moving_block_bootstrap_resamples = 2000
+moving_block_length_days = 7
+latency_stress_delay_bars = 2
+seed_policy = "SHA256_EXPERIMENT_ID"
+
+[paper]
+minimum_calendar_days = 180
+minimum_completed_round_trips = 30
+maximum_tracking_error_bps = 10.0
