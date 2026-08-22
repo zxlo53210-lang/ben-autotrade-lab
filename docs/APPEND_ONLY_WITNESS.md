@@ -24,7 +24,13 @@ Every opening burn binds at least:
 - the experiment ID and lockbox ID;
 - the locked-manifest SHA-256 and holdout commitment;
 - the opening commitment and opening authority;
-- the primary external anchor ID and anchor-record SHA-256.
+- the primary external anchor `store_id` and canonical store-descriptor
+  SHA-256.
+
+The opening burn precedes creation of the external opening record, so it cannot
+bind that record's SHA-256. The external-anchor record hash is created at the
+anchor step and is subsequently bound by local `HOLDOUT_OPENED` and the witness
+finalization record.
 
 An opening is globally one-shot by each of the experiment ID, lockbox ID, and
 holdout commitment. Reusing any one of them for another opening is rejected;

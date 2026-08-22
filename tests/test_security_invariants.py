@@ -5,13 +5,19 @@ import hashlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
-from ben_trade_lab.audit import create_pro_review_receipt, create_test_receipt
+from ben_trade_lab.audit import (
+    _redact_local_paths,
+    create_pro_review_receipt,
+    create_test_receipt,
+)
 from ben_trade_lab.cli import main
 from ben_trade_lab.config import canonical_json, load_config
 from ben_trade_lab.integrity import (
@@ -56,6 +62,7 @@ SAFE_ENVIRONMENT_KEYS = {
     "SYSTEMROOT",
     "TEMP",
     "TMP",
+    "TMPDIR",
     "WINDIR",
 }
 
@@ -469,13 +476,22 @@ class ReceiptIntegrityTests(unittest.TestCase):
 
     def test_test_receipt_binds_log_and_strips_credential_environment(self) -> None:
         config = load_config(ROOT / "configs" / "btcusdt_1h.toml")
+        inherited_temp_paths = (
+            r"Q:\Synthetic-Windows-Temp\private\..\Temp-One",
+            "/synthetic-posix-tmp/private/../tmp-two",
+            r"R:\機密-synthetic-windows-tmpdir\private\..\tmp-three",
+        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "src").mkdir()
             (root / "tests").mkdir()
             (root / "tests" / "test_environment.py").write_text(
+                "import json\n"
+                "import ntpath\n"
                 "import os\n"
+                "import posixpath\n"
                 "import unittest\n\n"
+                f"INHERITED_TEMP_PATHS = {inherited_temp_paths!r}\n\n"
                 "class EnvironmentTest(unittest.TestCase):\n"
                 "    def test_secret_is_absent(self):\n"
                 "        self.assertNotIn('BEN_TEST_SECRET', os.environ)\n\n"
@@ -484,7 +500,51 @@ class ReceiptIntegrityTests(unittest.TestCase):
                 "        self.assertEqual(os.environ['TEMP'], os.environ['TMPDIR'])\n\n"
                 "    def test_local_path_is_redacted(self):\n"
                 "        local_path = os.path.join(os.environ['TEMP'], 'private')\n"
-                "        self.skipTest(repr(local_path))\n",
+                "        self.skipTest(repr(local_path))\n\n"
+                "    def test_inherited_temp_spellings_are_redacted(self):\n"
+                "        child_temp_paths = {\n"
+                "            os.environ['TEMP'],\n"
+                "            os.environ['TMP'],\n"
+                "            os.environ['TMPDIR'],\n"
+                "        }\n"
+                "        self.assertTrue(child_temp_paths.isdisjoint(INHERITED_TEMP_PATHS))\n"
+                "        spellings = set()\n"
+                "        for value in INHERITED_TEMP_PATHS:\n"
+                "            value_spellings = set()\n"
+                "            normalized = {\n"
+                "                value,\n"
+                "                ntpath.normpath(value),\n"
+                "                posixpath.normpath(value),\n"
+                "            }\n"
+                "            for candidate in tuple(normalized):\n"
+                "                normalized.add(candidate.replace('\\\\', '/'))\n"
+                "                normalized.add(candidate.replace('/', '\\\\'))\n"
+                "            for candidate in normalized:\n"
+                "                representations = {\n"
+                "                    candidate,\n"
+                "                    repr(candidate),\n"
+                "                    ascii(candidate),\n"
+                "                    json.dumps(candidate, ensure_ascii=True),\n"
+                "                    json.dumps(candidate, ensure_ascii=False),\n"
+                "                }\n"
+                "                for representation in representations:\n"
+                "                    escaped = representation\n"
+                "                    for _ in range(4):\n"
+                "                        value_spellings.add(escaped)\n"
+                "                        if len(escaped) >= 2 and escaped[0] == escaped[-1] and escaped[0] in {'\\\"', \"'\"}:\n"
+                "                            value_spellings.add(escaped[1:-1])\n"
+                "                        escaped = escaped.replace('\\\\', '\\\\\\\\')\n"
+                "            nested_json = value\n"
+                "            for _ in range(7):\n"
+                "                nested_json = json.dumps(nested_json, ensure_ascii=True)\n"
+                "            value_spellings.add(nested_json)\n"
+                "            value_spellings.add(nested_json[1:-1])\n"
+                "            if ntpath.splitdrive(value)[0]:\n"
+                "                for spelling in tuple(value_spellings):\n"
+                "                    value_spellings.add(spelling.lower())\n"
+                "                    value_spellings.add(spelling.upper())\n"
+                "            spellings.update(value_spellings)\n"
+                "        print('\\n'.join(sorted(spellings)))\n",
                 encoding="utf-8",
             )
             (root / "tests" / "test_data_registry.py").write_text(
@@ -508,8 +568,10 @@ class ReceiptIntegrityTests(unittest.TestCase):
             )
             selection = _selection(root)
             parent_environment = os.environ.copy()
-            for key in ("TEMP", "TMP", "TMPDIR"):
-                parent_environment.pop(key, None)
+            for key, value in zip(
+                ("TEMP", "TMP", "TMPDIR"), inherited_temp_paths, strict=True
+            ):
+                parent_environment[key] = value
             parent_environment["BEN_TEST_SECRET"] = "must-not-propagate"
             try:
                 with patch.dict(os.environ, parent_environment, clear=True):
@@ -528,10 +590,109 @@ class ReceiptIntegrityTests(unittest.TestCase):
             audit_temp_root = root / "artifacts" / ".audit-tmp"
             self.assertNotIn(str(audit_temp_root), log_text)
             self.assertNotIn(repr(str(audit_temp_root))[1:-1], log_text)
+            for marker in (
+                "synthetic-windows-temp",
+                "synthetic-posix-tmp",
+                "synthetic-windows-tmpdir",
+            ):
+                self.assertNotIn(marker, log_text.casefold())
+            self.assertNotIn("\\u6a5f\\u5bc6", log_text.casefold())
             self.assertIn("<REDACTED_LOCAL_PATH>", log_text)
             log.write_bytes(log.read_bytes() + b"tampered\n")
             with self.assertRaises(ValueError):
                 verified_hashed_object(receipt_path, "receipt_sha256")
+
+    def test_local_path_redaction_order_is_hash_seed_independent(self) -> None:
+        script = (
+            "from pathlib import Path; "
+            "from ben_trade_lab.audit import _redact_local_paths; "
+            "print(_redact_local_paths("
+            "'abab', Path('/unrelated/root'), {'TEMP': 'aba', 'TMP': 'bab'}))"
+        )
+        outputs = set()
+        for seed in ("1", "2", "7"):
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PYTHONHASHSEED": seed,
+                    "PYTHONPATH": str(ROOT / "src"),
+                }
+            )
+            completed = subprocess.run(
+                [sys.executable, "-P", "-c", script],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+            )
+            outputs.add(completed.stdout.strip())
+        self.assertEqual(outputs, {"<REDACTED_LOCAL_PATH>b"})
+
+    def test_windows_casefold_does_not_over_redact_posix_paths(self) -> None:
+        windows_path = r"Q:\Private\Audit-Temp"
+        windows_unc_path = r"\\Server\Share\Private\Audit-Temp"
+        posix_path = "/Case/Sensitive/Audit-Temp"
+        output = (
+            "q:\\private\\audit-temp\\child.log\n"
+            "\\\\server\\share\\private\\audit-temp\\unc.log\n"
+            "/case/sensitive/audit-temp/child.log\n"
+            "/Case/Sensitive/Audit-Temp/child.log"
+        )
+        redacted = _redact_local_paths(
+            output,
+            Path("/unrelated/root"),
+            {
+                "TEMP": windows_path,
+                "TMP": windows_unc_path,
+                "TMPDIR": posix_path,
+            },
+        )
+        self.assertEqual(
+            redacted.splitlines(),
+            [
+                r"<REDACTED_LOCAL_PATH>\child.log",
+                r"<REDACTED_LOCAL_PATH>\unc.log",
+                "/case/sensitive/audit-temp/child.log",
+                "<REDACTED_LOCAL_PATH>/child.log",
+            ],
+        )
+
+    def test_forward_slash_unc_casefold_is_host_aware(self) -> None:
+        path = "//Server/Share/Case/Sensitive"
+        output = "//server/share/case/sensitive/child.log"
+        with patch("ben_trade_lab.audit.os.name", "posix"):
+            self.assertEqual(
+                _redact_local_paths(
+                    output,
+                    Path("/unrelated/root"),
+                    {"TMPDIR": path},
+                ),
+                output,
+            )
+        with patch("ben_trade_lab.audit.os.name", "nt"):
+            self.assertEqual(
+                _redact_local_paths(
+                    output,
+                    Path("/unrelated/root"),
+                    {"TMP": path},
+                ),
+                "<REDACTED_LOCAL_PATH>/child.log",
+            )
+
+    def test_quote_stripped_unicode_json_path_is_redacted(self) -> None:
+        path = r"R:\機密\Audit-Temp"
+        output = json.dumps(path, ensure_ascii=True)[1:-1]
+        self.assertEqual(
+            _redact_local_paths(
+                output,
+                Path("/unrelated/root"),
+                {},
+                (path,),
+            ),
+            "<REDACTED_LOCAL_PATH>",
+        )
 
     def test_full_provenance_replay_evidence_distinguishes_all_fail_closed_states(self) -> None:
         method = FULL_PROVENANCE_REPLAY_TEST_ID.rsplit(".", 1)[-1]
@@ -579,7 +740,11 @@ class ReceiptIntegrityTests(unittest.TestCase):
                     source, encoding="utf-8"
                 )
                 selection = _selection(root)
-                receipt_path = create_test_receipt(root, selection, config)
+                parent_environment = os.environ.copy()
+                for key in ("TEMP", "TMP", "TMPDIR"):
+                    parent_environment.pop(key, None)
+                with patch.dict(os.environ, parent_environment, clear=True):
+                    receipt_path = create_test_receipt(root, selection, config)
                 receipt = verified_hashed_object(receipt_path, "receipt_sha256")
                 self.assertEqual(receipt["status"], "PASS")
                 self.assertEqual(

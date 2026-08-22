@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import ntpath
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -52,8 +55,74 @@ def _prepare_audit_temp_root(root_path: Path) -> Path:
     return resolved
 
 
+def _quoted_inner(value: str) -> str | None:
+    if (
+        len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in {"'", '"'}
+    ):
+        return value[1:-1]
+    return None
+
+
+def _is_windows_path(value: str) -> bool:
+    """Identify Windows paths without case-folding ordinary POSIX paths."""
+
+    return bool(
+        re.match(r"^[A-Za-z]:", value)
+        or value.startswith("\\\\")
+        or (os.name == "nt" and value.startswith("//"))
+    )
+
+
+def _path_spellings(value: str, *, max_length: int) -> set[str]:
+    """Return common cross-platform and serialization spellings of a path."""
+
+    normalized = {
+        value,
+        os.path.normpath(value),
+        ntpath.normpath(value),
+        posixpath.normpath(value),
+    }
+    slash_variants = set(normalized)
+    for candidate in normalized:
+        slash_variants.update(
+            {candidate.replace("\\", "/"), candidate.replace("/", "\\")}
+        )
+
+    variants: set[str] = set()
+    for candidate in slash_variants:
+        representations = {
+            candidate,
+            repr(candidate),
+            ascii(candidate),
+            json.dumps(candidate, ensure_ascii=True),
+            json.dumps(candidate, ensure_ascii=False),
+        }
+        for representation in representations:
+            escaped = representation
+            while True:
+                inner = _quoted_inner(escaped)
+                if len(escaped) <= max_length:
+                    variants.add(escaped)
+                if inner is not None and len(inner) <= max_length:
+                    variants.add(inner)
+                if len(escaped) > max_length and (
+                    inner is None or len(inner) > max_length
+                ):
+                    break
+                next_escaped = escaped.replace("\\", "\\\\")
+                if next_escaped == escaped:
+                    break
+                escaped = next_escaped
+    return variants
+
+
 def _redact_local_paths(
-    output: str, root_path: Path, environment: dict[str, str]
+    output: str,
+    root_path: Path,
+    environment: dict[str, str],
+    inherited_temp_paths: tuple[str, ...] = (),
 ) -> str:
     """Remove host-specific repository and temporary-directory prefixes."""
 
@@ -63,28 +132,43 @@ def _redact_local_paths(
         for key in ("TEMP", "TMP", "TMPDIR")
         if (value := environment.get(key))
     )
-    variants: set[str] = set()
+    path_values.update(inherited_temp_paths)
+    variants: dict[str, bool] = {}
     for value in path_values:
-        normalized = os.path.normpath(value)
-        variants.update({value, normalized, normalized.replace("\\", "/")})
-        escaped = normalized
-        for _ in range(3):
-            escaped = escaped.replace("\\", "\\\\")
-            variants.add(escaped)
+        case_insensitive = _is_windows_path(value)
+        for variant in _path_spellings(value, max_length=len(output)):
+            variants[variant] = variants.get(variant, False) or case_insensitive
     redacted = output
-    for variant in sorted(variants, key=len, reverse=True):
+    ordered_variants = sorted(
+        variants.items(),
+        key=lambda item: (-len(item[0]), item[0].casefold(), item[0]),
+    )
+    for variant, case_insensitive in ordered_variants:
         if variant:
-            redacted = redacted.replace(variant, "<REDACTED_LOCAL_PATH>")
+            if case_insensitive:
+                redacted = re.sub(
+                    re.escape(variant),
+                    "<REDACTED_LOCAL_PATH>",
+                    redacted,
+                    flags=re.IGNORECASE,
+                )
+            else:
+                redacted = redacted.replace(variant, "<REDACTED_LOCAL_PATH>")
     return redacted
 
 
 def _normalize_test_output(
-    output: str, root_path: Path, environment: dict[str, str]
+    output: str,
+    root_path: Path,
+    environment: dict[str, str],
+    inherited_temp_paths: tuple[str, ...] = (),
 ) -> str:
     without_timing = re.sub(
         r"Ran (\d+) tests? in [0-9.]+s", r"Ran \1 tests", output
     )
-    return _redact_local_paths(without_timing, root_path, environment)
+    return _redact_local_paths(
+        without_timing, root_path, environment, inherited_temp_paths
+    )
 
 
 def _bound_fields(selection: dict[str, Any]) -> dict[str, Any]:
@@ -113,6 +197,15 @@ def _load_current_selection(
 
 def create_test_receipt(root: str | Path, selection_path: str | Path, config: LabConfig) -> Path:
     root_path = Path(root).resolve()
+    inherited_temp_paths = tuple(
+        value
+        for value in (
+            os.environ.get("TEMP"),
+            os.environ.get("TMP"),
+            os.environ.get("TMPDIR"),
+        )
+        if value
+    )
     selection, selection_relative = _load_current_selection(
         selection_path, config, root_path
     )
@@ -157,7 +250,9 @@ def create_test_receipt(root: str | Path, selection_path: str | Path, config: La
         check=False,
     )
     combined = completed.stdout + completed.stderr
-    normalized = _normalize_test_output(combined, root_path, environment)
+    normalized = _normalize_test_output(
+        combined, root_path, environment, inherited_temp_paths
+    )
     source_after = source_tree_sha256(root_path)
     source_unchanged = source_after == source_before == selection["source_tree_sha256"]
     if not source_unchanged:
