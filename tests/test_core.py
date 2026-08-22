@@ -8,10 +8,21 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from ben_trade_lab.anchor import initialize_anchor_store
 from ben_trade_lab.cli import main
-from ben_trade_lab.config import CANONICAL_ANCHOR_STORE_ID, _validate, load_config
+from ben_trade_lab.config import (
+    CANONICAL_ANCHOR_STORE_ID,
+    CANONICAL_WITNESS_FILESYSTEM_DEVICE,
+    CANONICAL_WITNESS_FILESYSTEM_INODE,
+    CANONICAL_WITNESS_HEADER_SHA256,
+    CANONICAL_WITNESS_POLICY,
+    CANONICAL_WITNESS_STORE_ID,
+    _validate,
+    load_config,
+)
 from ben_trade_lab.engine import ExecutionAssumptions, run_backtest
 from ben_trade_lab.models import Bar, ExecutionMode, StrategyParams
 from ben_trade_lab.paper import initialize_paper
@@ -120,16 +131,119 @@ class PolicyTests(unittest.TestCase):
                         ]
                     )
 
-    def test_finalize_and_paper_anchor_api_parameters_are_keyword_only(self) -> None:
+    def test_witness_cli_is_verify_only_and_bound_to_frozen_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            sandbox = Path(temporary)
+            ledger_path = sandbox / "nonexistent-witness.jsonl"
+            verified = SimpleNamespace(
+                store_id=CANONICAL_WITNESS_STORE_ID,
+                burns=(object(),),
+                finalizations=(object(),),
+            )
+            stream = io.StringIO()
+            with (
+                patch(
+                    "ben_trade_lab.cli.verify_witness_ledger",
+                    return_value=verified,
+                ) as verify,
+                redirect_stdout(stream),
+            ):
+                code = main(
+                    [
+                        "--root",
+                        str(ROOT),
+                        "--config",
+                        str(ROOT / "configs" / "btcusdt_1h.toml"),
+                        "witness",
+                        "verify",
+                        "--witness-ledger",
+                        str(ledger_path),
+                        "--witness-store-id",
+                        CANONICAL_WITNESS_STORE_ID,
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                json.loads(stream.getvalue()),
+                {
+                    "status": "WITNESS_VERIFIED",
+                    "witness_store_id": CANONICAL_WITNESS_STORE_ID,
+                    "opening_burn_count": 1,
+                    "finalization_count": 1,
+                },
+            )
+            verify.assert_called_once_with(
+                str(ledger_path),
+                repository_root=ROOT.resolve(),
+                expected_store_id=CANONICAL_WITNESS_STORE_ID,
+                expected_header_sha256=CANONICAL_WITNESS_HEADER_SHA256,
+                expected_device=CANONICAL_WITNESS_FILESYSTEM_DEVICE,
+                expected_inode=CANONICAL_WITNESS_FILESYSTEM_INODE,
+            )
+            self.assertFalse(ledger_path.exists())
+
+            with (
+                patch("ben_trade_lab.cli.verify_witness_ledger") as wrong_verify,
+                self.assertRaisesRegex(
+                    ValueError,
+                    "does not match the frozen config",
+                ),
+            ):
+                main(
+                    [
+                        "--root",
+                        str(ROOT),
+                        "--config",
+                        str(ROOT / "configs" / "btcusdt_1h.toml"),
+                        "witness",
+                        "verify",
+                        "--witness-ledger",
+                        str(ledger_path),
+                        "--witness-store-id",
+                        "f" * 64,
+                    ]
+                )
+            wrong_verify.assert_not_called()
+            self.assertFalse(ledger_path.exists())
+
+            for forbidden in ("init", "delete", "reset", "repair"):
+                with (
+                    self.subTest(command=forbidden),
+                    redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    main(
+                        [
+                            "--root",
+                            str(ROOT),
+                            "--config",
+                            str(ROOT / "configs" / "btcusdt_1h.toml"),
+                            "witness",
+                            forbidden,
+                        ]
+                    )
+            self.assertFalse(ledger_path.exists())
+
+    def test_finalize_and_paper_external_store_parameters_are_keyword_only(self) -> None:
         for function in (finalize_holdout, initialize_paper):
             parameters = inspect.signature(function).parameters
-            self.assertEqual(parameters["anchor_root"].kind, inspect.Parameter.KEYWORD_ONLY)
-            self.assertEqual(
-                parameters["anchor_store_id"].kind,
-                inspect.Parameter.KEYWORD_ONLY,
-            )
+            for name in (
+                "anchor_root",
+                "anchor_store_id",
+                "witness_ledger",
+                "witness_store_id",
+            ):
+                with self.subTest(function=function.__name__, parameter=name):
+                    self.assertEqual(
+                        parameters[name].kind,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )
+                    self.assertIs(
+                        parameters[name].default,
+                        inspect.Parameter.empty,
+                    )
 
-        required_cli_cases = (
+        cli_bases = (
             [
                 "research",
                 "finalize",
@@ -141,12 +255,34 @@ class PolicyTests(unittest.TestCase):
                 "test.json",
                 "--review-receipt",
                 "review.json",
+                "--anchor-root",
+                "anchor",
+                "--anchor-store-id",
+                CANONICAL_ANCHOR_STORE_ID,
             ],
-            ["paper", "init", "--report", "report.json"],
+            [
+                "paper",
+                "init",
+                "--report",
+                "report.json",
+                "--anchor-root",
+                "anchor",
+                "--anchor-store-id",
+                CANONICAL_ANCHOR_STORE_ID,
+            ],
         )
-        for arguments in required_cli_cases:
-            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                main(arguments)
+        for base in cli_bases:
+            for arguments in (
+                base,
+                [*base, "--witness-ledger", "witness.jsonl"],
+                [*base, "--witness-store-id", CANONICAL_WITNESS_STORE_ID],
+            ):
+                with (
+                    self.subTest(arguments=arguments),
+                    redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    main(arguments)
 
     def test_config_is_zero_authority(self) -> None:
         config = load_config(ROOT / "configs" / "btcusdt_1h.toml")
@@ -154,6 +290,63 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(config.execution["allow_leverage"])
         self.assertEqual(config.market["source_base_url"], "https://data-api.binance.vision")
         self.assertLessEqual(len(config.strategy_grid()), config.raw["selection"]["maximum_trials"])
+
+    def test_frozen_witness_config_is_exact_and_strict(self) -> None:
+        config = load_config(ROOT / "configs" / "btcusdt_1h.toml")
+        self.assertEqual(
+            config.witness,
+            {
+                "store_id": CANONICAL_WITNESS_STORE_ID,
+                "header_sha256": CANONICAL_WITNESS_HEADER_SHA256,
+                "filesystem_device": CANONICAL_WITNESS_FILESYSTEM_DEVICE,
+                "filesystem_inode": CANONICAL_WITNESS_FILESYSTEM_INODE,
+                "policy": CANONICAL_WITNESS_POLICY,
+            },
+        )
+
+        mutations = (
+            ("store_id", "f" * 64, "store identity is frozen"),
+            ("header_sha256", "f" * 64, "witness header is frozen"),
+            (
+                "filesystem_device",
+                CANONICAL_WITNESS_FILESYSTEM_DEVICE + 1,
+                "filesystem device is frozen",
+            ),
+            (
+                "filesystem_device",
+                True,
+                "filesystem device is frozen",
+            ),
+            (
+                "filesystem_inode",
+                CANONICAL_WITNESS_FILESYSTEM_INODE + 1,
+                "witness inode is frozen",
+            ),
+            ("filesystem_inode", True, "witness inode is frozen"),
+            ("policy", "RESETTABLE", "witness policy is frozen"),
+        )
+        for field, value, message in mutations:
+            with self.subTest(field=field, value=value):
+                changed = copy.deepcopy(config.raw)
+                changed["witness"][field] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    _validate(changed)
+
+        malformed_sections = (
+            [],
+            {
+                key: value
+                for key, value in config.witness.items()
+                if key != "header_sha256"
+            },
+            {**config.witness, "reset_allowed": False},
+        )
+        for witness in malformed_sections:
+            with self.subTest(witness=witness):
+                changed = copy.deepcopy(config.raw)
+                changed["witness"] = witness
+                with self.assertRaisesRegex(ValueError, "witness schema is frozen"):
+                    _validate(changed)
 
     def test_frozen_contract_rejects_predeclared_gate_or_cost_mutation(self) -> None:
         config = load_config(ROOT / "configs" / "btcusdt_1h.toml")
@@ -186,6 +379,32 @@ class PolicyTests(unittest.TestCase):
         changed_anchor_policy["anchor"]["policy"] = "RESETTABLE"
         with self.assertRaisesRegex(ValueError, "anchor policy is frozen"):
             _validate(changed_anchor_policy)
+
+    def test_frozen_numeric_fields_reject_coercible_wrong_types(self) -> None:
+        config = load_config(ROOT / "configs" / "btcusdt_1h.toml")
+        cases = (
+            ("execution", "signal_fill_delay_bars", True, "base-latency"),
+            ("execution", "initial_cash", "10000.0", "cash, cost"),
+            ("strategy", "volatility_lookback", 720.0, "parameter grid"),
+            ("selection", "maximum_trials", 16.9, "trial budget"),
+            ("selection", "expected_fold_count", True, "nine scoring folds"),
+            ("selection", "minimum_fold_months", "6", "six-month folds"),
+            (
+                "selection",
+                "minimum_fold_exposure_fraction",
+                "0.05",
+                "exposure bounds",
+            ),
+            ("acceptance", "minimum_holdout_sharpe", "0.8", "acceptance gates"),
+            ("diagnostics", "latency_stress_delay_bars", True, "latency stress"),
+            ("paper", "minimum_calendar_days", 180.0, "paper-validation gates"),
+        )
+        for section, field, replacement, message in cases:
+            with self.subTest(section=section, field=field, replacement=replacement):
+                changed = copy.deepcopy(config.raw)
+                changed[section][field] = replacement
+                with self.assertRaisesRegex(ValueError, message):
+                    _validate(changed)
 
     def test_v12_execution_semantic_literals_are_exact_and_frozen(self) -> None:
         config = load_config(ROOT / "configs" / "btcusdt_1h.toml")

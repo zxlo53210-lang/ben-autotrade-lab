@@ -96,6 +96,11 @@ not read or score its price bytes.
   --model-visible "<visible label>" --reasoning-visible "<visible label>"
 ```
 
+The moving-block bootstrap stored with the selection is narrowly a family-wise
+max-Sharpe null diagnostic. It is non-gating and is not a complete correction
+for selecting by median walk-forward Calmar; it cannot rescue a failed gate or
+upgrade the evidence label.
+
 The canonical create-only anchor store was provisioned once outside the
 repository before candidate selection. v1.2 freezes both its 64-hex `store_id`
 and unique descriptor hash in the configuration. Deployment must copy the
@@ -110,35 +115,72 @@ artifacts.
   --anchor-store-id <64-hex-store-id>
 ```
 
+Opening and finalization also require the exact pre-provisioned append-only
+witness inode on WSL/ext4. The frozen configuration pins its store ID, canonical
+header hash, filesystem device, inode, and policy; its machine-specific absolute
+path is supplied only at runtime. Verification is read-only:
+
+```bash
+PYTHONPATH="$PWD/src" .venv-linux/bin/python -m ben_trade_lab witness verify \
+  --witness-ledger '<absolute-linux-ext4-witness-ledger>' \
+  --witness-store-id <64-hex-store-id>
+```
+
+There is intentionally no witness initialize, reset, repair, truncate, delete,
+or inode-flag command. A witness on Windows, a Drives-backed `/mnt/c` or
+`/mnt/d` file, a replaced inode, or a Linux file without confirmed
+`FS_APPEND_FL` fails closed.
+
 Finalization is deliberately one shot. It requires the exact source-bound test
 and independent-review receipts. The already-ended 2024-08 through 2026-07
 segment is reported as `RETROSPECTIVE_LOCKED_OOS`, not prospective proof.
 
-```powershell
-& .\.venv\Scripts\python.exe -m ben_trade_lab research finalize `
-  --manifest <locked-holdout-manifest> --selection <selection> `
-  --test-receipt <test-receipt> --review-receipt <review-receipt> `
-  --anchor-root '<absolute-external-anchor-root>' `
-  --anchor-store-id <64-hex-store-id>
+```bash
+PYTHONPATH="$PWD/src" .venv-linux/bin/python -m ben_trade_lab research finalize \
+  --manifest <locked-holdout-manifest> --selection <selection> \
+  --test-receipt <test-receipt> --review-receipt <review-receipt> \
+  --anchor-root '<absolute-external-anchor-root>' \
+  --anchor-store-id <64-hex-store-id> \
+  --witness-ledger '<absolute-linux-ext4-witness-ledger>' \
+  --witness-store-id <64-hex-store-id>
 ```
 
-Before any locked price byte is loaded, finalization durably creates the
-experiment's external `HOLDOUT_OPENED` anchor and then its linked local state.
-Once the external record exists, interruption, local-state deletion, or failure
-cannot be retried against the same study generation. A failure is
-`NOT_PROVEN`; it is not permission to weaken dates, costs, parameters, or gates.
+Finalization must run under Linux/WSL. After all price-free preflight checks, it
+allocates the locked OOS globally by experiment ID, lockbox ID, and holdout data
+commitment. Before any locked price byte is loaded, it durably appends the
+witness opening burn, creates the external `HOLDOUT_OPENED` anchor, and creates
+the linked local `HOLDOUT_OPENED` state, in that order. A surviving witness burn
+prevents the same experiment, lockbox, or holdout commitment from being opened
+again even if the repository and primary anchor are both restored to pre-open
+bytes.
+
+After evaluation, the content-addressed report is written first. Its hash,
+status, kind, opened-state hash, and external-anchor hash are then appended as a
+witness finalization record before local `FINALIZED` is created. Interruption
+after either append is consumed and cannot be repaired or retried by this
+runtime. A failed gate is `NOT_PROVEN`; it is not permission to weaken dates,
+costs, parameters, or gates.
 
 Paper initialization is also gated. It requires a self-hashed
 `BACKTEST_CANDIDATE` report plus the exact selection, passing test receipt,
 `PROCEED` review receipt, one-shot experiment-state chain, frozen source tree,
 configuration, lockbox, and data commitments bound by that report:
 
-```powershell
-& .\.venv\Scripts\python.exe -m ben_trade_lab paper init `
-  --report <holdout-report> `
-  --anchor-root '<absolute-external-anchor-root>' `
-  --anchor-store-id <64-hex-store-id>
+```bash
+PYTHONPATH="$PWD/src" .venv-linux/bin/python -m ben_trade_lab paper init \
+  --report <holdout-report> \
+  --anchor-root '<absolute-external-anchor-root>' \
+  --anchor-store-id <64-hex-store-id> \
+  --witness-ledger '<absolute-linux-ext4-witness-ledger>' \
+  --witness-store-id <64-hex-store-id>
 ```
+
+Before creating the PAPER journal, initialization re-verifies the frozen
+selection, receipts, LOCKED manifest metadata, witness opening and finalization
+records, external anchor, and local state chain. It then deterministically
+replays the primary, benchmark, cost-stress, latency-stress, and every frozen
+neighbor OOS scenario and requires exact agreement with the report, including
+recomputed aggregates and gates.
 
 `paper run-once` remains fail-closed until the causal forward runner and replay
 parity suite are complete. There is no command, configuration value, dependency,
@@ -154,6 +196,9 @@ or network adapter for live trading.
 - `state/experiments/`: ignored one-shot state-transition receipts
 - external anchor store: portable, create-only per-experiment opening records;
   it must remain outside the repository and is never committed
+- external WSL/ext4 witness ledger: globally sequenced opening and finalization
+  commitments on the exact frozen append-only inode; it is never committed and
+  its absolute path is never embedded in research artifacts
 - `docs/reviews/`: sanitized review summaries only
 
 Start with [the research contract](docs/RESEARCH_CONTRACT.md) and

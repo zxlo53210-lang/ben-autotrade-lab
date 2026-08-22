@@ -47,8 +47,20 @@ FULL source and proves that the exact selection-bound PRE and LOCKED bytes are
 canonical parent slices. It cannot call strategy/metric code or return price
 rows to the researcher/model. Its allowed external evidence is limited to
 hashes, counts, and PASS/FAIL. The default test suite does not enable this
-replay; ordinary LOCKED access remains blocked until the external anchor and
-local one-shot open state are durably committed.
+replay. Ordinary LOCKED access remains blocked until the exact WSL/ext4
+append-only witness has durably allocated the experiment ID, lockbox ID, and
+holdout data commitment, after which the external anchor and local one-shot
+`HOLDOUT_OPENED` state must also be durably committed and cross-validated. The
+price-bearing load is re-bound to the complete pre-open manifest object before
+any metric is calculated.
+
+After evaluation, the content-addressed report is written before a second
+append-only witness record binds its hash, status, kind, opened-state hash, and
+external anchor. Local `FINALIZED` is written only after that witness
+finalization is durable. PAPER initialization revalidates this full chain and
+then independently reloads the exact LOCKED manifest and deterministically
+replays every reported primary, benchmark, cost-stress, latency-stress, and
+frozen-neighbor metric scenario before granting PAPER authority.
 
 Downloaded market data is intentionally excluded from Git. The public
 repository tracks one price-free provenance-root manifest containing request

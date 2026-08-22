@@ -71,6 +71,13 @@ store_id = "64acdb6e068cd88f1db2045ebf0dd2f6d93c6710b338f2b4e4898c927e4ef47e"
 store_sha256 = "0f12006fa9f7d5137faa77f694b59bce4afe34899f93ca9785d1ab923ab1a995"
 policy = "CREATE_ONLY_PER_EXPERIMENT_HASH_CHAIN_V1"
 
+[witness]
+store_id = "3e19a9e67f76ed22f2345d202f607d006ac512f24f7ff96e85822133870dcca9"
+header_sha256 = "b28626b92481c06f86f6757113f89b123f2eac170ab0387f70567e2f67a0da2c"
+filesystem_device = 2096
+filesystem_inode = 2434
+policy = "LINUX_FS_APPEND_FL_ONE_SHOT_BURN_LEDGER_V1"
+
 [paper]
 minimum_calendar_days = 180
 minimum_completed_round_trips = 30

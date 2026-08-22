@@ -23,9 +23,11 @@ from .integrity import verified_hashed_object
 from .paper import initialize_paper, paper_status, stop_paper
 from .validation import (
     _require_config_anchor_store_id,
+    _require_config_witness_store_id,
     finalize_holdout,
     select_candidate,
 )
+from .witness import verify_witness_ledger
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -40,6 +42,12 @@ def _parser() -> argparse.ArgumentParser:
     anchor_verify = anchor_commands.add_parser("verify")
     anchor_verify.add_argument("--anchor-root", required=True)
     anchor_verify.add_argument("--anchor-store-id", required=True)
+
+    witness = subcommands.add_parser("witness")
+    witness_commands = witness.add_subparsers(dest="witness_command", required=True)
+    witness_verify = witness_commands.add_parser("verify")
+    witness_verify.add_argument("--witness-ledger", required=True)
+    witness_verify.add_argument("--witness-store-id", required=True)
 
     data = subcommands.add_parser("data")
     data_commands = data.add_subparsers(dest="data_command", required=True)
@@ -60,6 +68,8 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--review-receipt", required=True)
     finalize.add_argument("--anchor-root", required=True)
     finalize.add_argument("--anchor-store-id", required=True)
+    finalize.add_argument("--witness-ledger", required=True)
+    finalize.add_argument("--witness-store-id", required=True)
 
     audit = subcommands.add_parser("audit")
     audit_commands = audit.add_subparsers(dest="audit_command", required=True)
@@ -79,6 +89,8 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--capital", type=float, default=1000.0)
     init.add_argument("--anchor-root", required=True)
     init.add_argument("--anchor-store-id", required=True)
+    init.add_argument("--witness-ledger", required=True)
+    init.add_argument("--witness-store-id", required=True)
     paper_commands.add_parser("status")
     paper_commands.add_parser("stop")
     paper_commands.add_parser("run-once")
@@ -125,6 +137,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "status": "ANCHOR_STORE_VERIFIED",
                 "anchor_root": str(store.root),
                 "anchor_store_id": store.store_id,
+            }
+        )
+        return 0
+
+    if args.command == "witness":
+        _require_config_witness_store_id(config, args.witness_store_id)
+        configured = config.witness
+        ledger = verify_witness_ledger(
+            args.witness_ledger,
+            repository_root=root,
+            expected_store_id=args.witness_store_id,
+            expected_header_sha256=str(configured["header_sha256"]),
+            expected_device=int(configured["filesystem_device"]),
+            expected_inode=int(configured["filesystem_inode"]),
+        )
+        _emit(
+            {
+                "status": "WITNESS_VERIFIED",
+                "witness_store_id": ledger.store_id,
+                "opening_burn_count": len(ledger.burns),
+                "finalization_count": len(ledger.finalizations),
             }
         )
         return 0
@@ -194,6 +227,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.review_receipt,
                 anchor_root=args.anchor_root,
                 anchor_store_id=args.anchor_store_id,
+                witness_ledger=args.witness_ledger,
+                witness_store_id=args.witness_store_id,
                 root=root,
             )
         _emit({"status": "PASS", "artifact": str(artifact)})
@@ -236,6 +271,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.capital,
                 anchor_root=args.anchor_root,
                 anchor_store_id=args.anchor_store_id,
+                witness_ledger=args.witness_ledger,
+                witness_store_id=args.witness_store_id,
             )
         )
         return 0

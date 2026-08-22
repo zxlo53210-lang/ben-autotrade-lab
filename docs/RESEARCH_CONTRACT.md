@@ -95,6 +95,11 @@ All gates are conjunctive. A candidate is `BACKTEST_CANDIDATE` only when:
 
 Failure yields `NOT_PROVEN`, not a revised test.
 
+The moving-block bootstrap recorded with selection is limited to a family-wise
+max-Sharpe null diagnostic over the candidate return family. It is non-gating,
+does not implement a complete selection correction for the median walk-forward
+Calmar objective, and cannot promote or rescue a candidate.
+
 ## Maturity labels
 
 - `RESEARCH_NOT_YET_VALIDATED`: implementation or evaluation incomplete.
@@ -124,35 +129,52 @@ selection performs a metadata-only PRE/config gate before any price I/O and
 must reject FULL or LOCKED inputs before their price files are read. The PRE
 manifest binds the exact LOCKED manifest path, file hash, paired descriptor,
 data commitment, and lockbox ID without loading or scoring LOCKED prices.
-Finalization requires
-exact config, source, code, data, passing-test, and Pro-review receipts. A
-canonical, crash-durable, self-hashed experiment receipt chain transitions
-`FROZEN -> external HOLDOUT_OPENED anchor -> local HOLDOUT_OPENED -> FINALIZED`.
-The external store is an absolute, explicitly supplied directory outside the
-repository and is bound by both the canonical 64-hex store ID and the unique
-canonical descriptor SHA-256 frozen in the v1.2 configuration and source before
-candidate selection. The store is provisioned once; ordinary CLI operation can
-verify it but cannot initialize, replace, reset, repair, or delete it. Deployment
-must copy the complete store, including every record, while no absolute machine
-path is stored in research artifacts.
-Every state binds the previous state hash and the exact
-selection/config/source/data/test/review/report
-commitments appropriate to that transition. `FROZEN`, manifest metadata, and
-both audit receipts are fully validated before the opening event. The external
-record is then exclusively created and durably flushed before the linked local
-state, and both are re-read before any locked price byte is loaded. Any existing,
-partial, corrupt, missing, or inconsistent external/local opening record fails
-closed. Once the external record exists, the experiment is permanently
-consumed even if the local experiment directory is deleted or the process
-crashes. Neither a retry, repair, force, reset, nor prune operation exists.
+Finalization requires exact config, source, code, data, passing-test, and
+Pro-review receipts. Its canonical durable sequence is:
 
-This create-only store protects against ordinary repository rollback and
-accidental local-state deletion. Its pinned descriptor rejects a newly created
-empty store that merely reuses the public store ID. Without a signing key,
-operating-system WORM, or an independent remote witness, it does not claim to
-defeat an administrator who duplicates the descriptor before use, selectively
-deletes records, or deletes or rewrites every copy of both the repository and
-anchor store.
+`FROZEN -> witness opening burn -> external HOLDOUT_OPENED anchor -> local HOLDOUT_OPENED -> locked load and evaluation -> immutable report -> witness finalization -> local FINALIZED`.
+
+The primary external anchor is an explicitly supplied directory outside the
+repository. Its canonical store ID and descriptor SHA-256 are frozen before
+candidate selection. The append-only witness is a separately supplied regular
+file on WSL/ext4 or another Linux filesystem that implements `FS_APPEND_FL`.
+The frozen configuration pins its store ID, header SHA-256, filesystem device,
+inode, and policy; neither external absolute path is stored in research
+artifacts. Ordinary CLI operation may verify these stores but cannot initialize,
+replace, reset, repair, truncate, delete, or change the witness inode flag.
+
+Every state binds the preceding state and the exact
+selection/config/source/data/test/review/report commitments appropriate to that
+transition. `FROZEN`, LOCKED manifest metadata, both audit receipts, both
+external stores, and the full opening plan are validated before the witness is
+mutated. The witness opening burn is then appended and durably flushed under a
+global sequence and hash chain. It allocates exactly one use for each experiment
+ID, lockbox ID, and holdout data commitment. The external anchor and linked local
+`HOLDOUT_OPENED` state are committed only after that burn; all three records are
+re-read and cross-checked before any locked price byte is loaded. Any existing,
+partial, corrupt, missing, or inconsistent record fails closed. Once the burn is
+attempted, the allocation is consumed even if later writes fail, local state is
+deleted, or the repository and primary anchor are restored to pre-open bytes.
+Neither a retry, repair, force, reset, nor prune operation exists.
+After the authorized locked load, the complete verified manifest object must
+still equal the pre-open metadata byte-for-byte in canonical form and must
+repeat every manifest, partition, parent, lockbox, PRE, and LOCKED commitment
+frozen by the selection. A replacement detected at that point consumes the
+one-shot opening but cannot run metrics or produce a report.
+
+After evaluation, the content-addressed report is durably written first. The
+witness then appends a finalization record binding the opening burn, local
+opened-state hash, external-anchor hash, report hash, report status, and report
+kind. Only after that append is re-read may local `FINALIZED` be created. A
+crash or mismatch at either boundary remains consumed and non-retryable.
+
+The witness protects against rollback by the unprivileged laboratory process
+only while its exact inode and records survive. It is not an administrator-proof
+or hardware-WORM claim: Linux root or a process with `CAP_LINUX_IMMUTABLE` can
+clear the append-only flag, and rollback of the whole WSL/ext4 volume can restore
+both inode identity and ledger bytes. Those stronger threats require a genuinely
+retained WORM device, TPM-backed monotonic service, or independent remote
+transparency witness.
 
 Before opening the holdout, a separately gated data-only provenance replay may
 parse the full source solely to verify raw bytes, canonical normalization,
@@ -160,8 +182,18 @@ registered anomalies, partition boundaries, and commitments. It must not
 return price rows to the researcher/model, call strategy or metric code, or
 emit any locked-period performance. The ordinary test suite leaves this replay
 disabled; explicit isolated mode may expose only hashes, counts, and PASS/FAIL.
-The strategy/evaluation path cannot load the locked manifest until the
-authenticated `HOLDOUT_OPENED` state has been durably committed.
+The strategy/evaluation path cannot load the locked manifest until the witness
+opening burn, external anchor, and authenticated local `HOLDOUT_OPENED` state
+have all been durably committed and revalidated.
+
+PAPER initialization never trusts a top-level passing-gate map by itself. It
+revalidates the full witness opening and finalization chain, primary anchor,
+local state chain, selection, receipts, and LOCKED metadata. It requires exact
+nested schemas and finite typed values, re-derives selection aggregates and the
+frozen neighbor set, and deterministically reruns the primary, benchmark,
+cost-stress, latency-stress, and every frozen-neighbor OOS scenario. The replayed
+metrics, report fields, and recomputed gates must agree exactly before the PAPER
+journal is created.
 
 The nine pre-OOS folds share one continuous strategy/account run. The
 retrospective OOS separately resets both strategy and portfolio to cash while

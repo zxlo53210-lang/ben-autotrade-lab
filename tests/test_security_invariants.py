@@ -22,6 +22,9 @@ from ben_trade_lab.integrity import (
     write_immutable,
 )
 from ben_trade_lab.validation import (
+    BENCHMARK_PROTOCOL,
+    HOLDOUT_GATE_FIELDS,
+    HOLDOUT_REPORT_SCHEMA_VERSION,
     HOLDOUT_SUCCESS_REPORT_FIELDS,
     REPORT_KIND_LOCKED_OOS_EVALUATION,
     REPORT_KIND_TERMINAL_LIQUIDATION_FAILURE,
@@ -55,6 +58,46 @@ SAFE_ENVIRONMENT_KEYS = {
     "TMP",
     "WINDIR",
 }
+
+
+def _report_metric() -> dict[str, object]:
+    initial_cash = 10_000.0
+    terminal_equity = 11_000.0
+    elapsed_hours = 2.0
+    elapsed_years = max(elapsed_hours / (365.25 * 24.0), 1.0 / 365.25)
+    cagr = (terminal_equity / initial_cash) ** (1.0 / elapsed_years) - 1.0
+    return {
+        "initial_cash": initial_cash,
+        "terminal_equity": terminal_equity,
+        "mark_to_market_terminal_equity": terminal_equity,
+        "mark_to_market_total_return": 0.10,
+        "terminal_liquidation_applied": False,
+        "terminal_liquidation_executable": True,
+        "terminal_state_eligible": True,
+        "terminal_liquidation_value": terminal_equity,
+        "terminal_liquidation_cost": 0.0,
+        "terminal_liquidation_slippage_cost": 0.0,
+        "terminal_liquidation_fee": 0.0,
+        "terminal_liquidation_reference_price": 100.0,
+        "terminal_liquidation_execution_price": 100.0,
+        "terminal_open_quantity": 0.0,
+        "total_return": 0.10,
+        "cagr": cagr,
+        "annualized_sharpe_daily": 1.0,
+        "annualized_sortino_daily": 1.0,
+        "maximum_drawdown": -0.10,
+        "calmar": cagr / 0.10,
+        "completed_round_trips": 40,
+        "fill_count": 80,
+        "exposure_fraction": 0.5,
+        "total_fees": 10.0,
+        "performance_total_fees_including_terminal_liquidation": 10.0,
+        "maximum_positive_quarter_mark_to_market_profit_concentration": 0.4,
+        "start_open_time_ms": 0,
+        "end_open_time_ms": 3_600_000,
+        "equity_points": 2,
+        "elapsed_hours": elapsed_hours,
+    }
 
 
 def _selection(root: Path) -> Path:
@@ -206,7 +249,7 @@ class SourceBoundaryTests(unittest.TestCase):
 
 
 class ReceiptIntegrityTests(unittest.TestCase):
-    def test_selection_and_holdout_report_require_exact_v12_schemas(self) -> None:
+    def test_selection_v12_and_holdout_report_v13_require_exact_schemas(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "src").mkdir()
@@ -259,30 +302,129 @@ class ReceiptIntegrityTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "experiment identity mismatch"):
                 _verified_selection_artifact(forged_path)
 
-            report = {
-                field: "0" * 64 if field.endswith("_sha256") else None
-                for field in HOLDOUT_SUCCESS_REPORT_FIELDS
-                if field != "report_sha256"
+            selected_params = {
+                "entry_lookback": 72,
+                "exit_lookback": 24,
+                "trend_lookback": 336,
+                "volatility_lookback": 720,
+                "target_annualized_volatility": 0.3,
+                "volatility_floor": 0.1,
             }
-            report.update(
-                {
-                    "schema_version": "1.2.0",
-                    "report_kind": REPORT_KIND_LOCKED_OOS_EVALUATION,
-                    "status": "BACKTEST_CANDIDATE",
-                }
-            )
+            report = {
+                "schema_version": HOLDOUT_REPORT_SCHEMA_VERSION,
+                "report_kind": REPORT_KIND_LOCKED_OOS_EVALUATION,
+                "status": "BACKTEST_CANDIDATE",
+                "capability": "LIVE_DISABLED",
+                "authority": "RESEARCH_ONLY_ZERO_LIVE_AUTHORITY",
+                "profit_claim": "NONE",
+                "evaluation_label": "RETROSPECTIVE_LOCKED_OOS",
+                "evidence_level": "RETROSPECTIVE_LOCKED_OOS",
+                "experiment_id": "0" * 64,
+                "selection_sha256": "0" * 64,
+                "holdout_manifest_sha256": "0" * 64,
+                "holdout_data_sha256": "0" * 64,
+                "config_sha256": "0" * 64,
+                "source_tree_sha256": "0" * 64,
+                "test_receipt_sha256": "0" * 64,
+                "review_receipt_sha256": "0" * 64,
+                "holdout_opened_state_sha256": "0" * 64,
+                "opening_commitment_sha256": "0" * 64,
+                "external_anchor_store_id": "0" * 64,
+                "external_anchor_store_sha256": "0" * 64,
+                "external_anchor_sha256": "0" * 64,
+                "witness_store_id": "0" * 64,
+                "witness_header_sha256": "0" * 64,
+                "witness_filesystem_device": 2096,
+                "witness_filesystem_inode": 2434,
+                "witness_burn_sequence": 1,
+                "witness_burn_sha256": "0" * 64,
+                "selected_params": selected_params,
+                "holdout": {
+                    "start_ms": 0,
+                    "end_ms_exclusive": 7_200_000,
+                    "account_state": "RESET_TO_INITIAL_CASH",
+                    "strategy_state": "RESET_FIRST_SIGNAL_FROM_HOLDOUT",
+                    "indicator_context_hours": 720,
+                },
+                "metrics": _report_metric(),
+                "benchmark_protocol": BENCHMARK_PROTOCOL,
+                "benchmark_buy_and_hold": _report_metric(),
+                "cost_stress": {"2x": _report_metric(), "3x": _report_metric()},
+                "latency_stress": {
+                    "signal_delay_bars": 2,
+                    "metrics": _report_metric(),
+                },
+                "preholdout_parameter_neighbor_fraction": 0.0,
+                "holdout_parameter_neighbors": [],
+                "holdout_parameter_neighbor_protocol": {
+                    "primary_excluded": True,
+                    "replacement_allowed": False,
+                    "exact_frozen_neighbor_count": 0,
+                },
+                "holdout_parameter_neighbor_positive_fraction": 0.0,
+                "holdout_gap_events": 0,
+                "holdout_missing_hours": 0,
+                "gates": {field: True for field in HOLDOUT_GATE_FIELDS},
+            }
+            self.assertEqual(set(report) | {"report_sha256"}, HOLDOUT_SUCCESS_REPORT_FIELDS)
             report_sha = hashlib.sha256(canonical_json(report)).hexdigest()
             report["report_sha256"] = report_sha
             report_path = root / f"holdout-{report_sha[:16]}.json"
             write_immutable(report_path, canonical_json(report) + b"\n")
             self.assertEqual(
                 _verified_holdout_report_artifact(report_path)["schema_version"],
-                "1.2.0",
+                "1.3.0",
             )
+
+            missing_witness = dict(report)
+            missing_witness.pop("report_sha256")
+            missing_witness.pop("witness_burn_sha256")
+            missing_witness_sha = hashlib.sha256(canonical_json(missing_witness)).hexdigest()
+            missing_witness["report_sha256"] = missing_witness_sha
+            missing_witness_path = root / f"holdout-{missing_witness_sha[:16]}.json"
+            write_immutable(
+                missing_witness_path,
+                canonical_json(missing_witness) + b"\n",
+            )
+            with self.assertRaisesRegex(ValueError, "schema mismatch"):
+                _verified_holdout_report_artifact(missing_witness_path)
+
+            non_integer_witness = dict(report)
+            non_integer_witness.pop("report_sha256")
+            non_integer_witness["witness_filesystem_device"] = 2096.0
+            non_integer_witness_sha = hashlib.sha256(
+                canonical_json(non_integer_witness)
+            ).hexdigest()
+            non_integer_witness["report_sha256"] = non_integer_witness_sha
+            non_integer_witness_path = root / f"holdout-{non_integer_witness_sha[:16]}.json"
+            write_immutable(
+                non_integer_witness_path,
+                canonical_json(non_integer_witness) + b"\n",
+            )
+            with self.assertRaisesRegex(ValueError, "witness_filesystem_device is invalid"):
+                _verified_holdout_report_artifact(non_integer_witness_path)
+
+            inconsistent_metric = dict(report)
+            inconsistent_metric.pop("report_sha256")
+            inconsistent_metric["metrics"] = dict(inconsistent_metric["metrics"])
+            inconsistent_metric["metrics"]["cagr"] = 0.10
+            inconsistent_metric_sha = hashlib.sha256(
+                canonical_json(inconsistent_metric)
+            ).hexdigest()
+            inconsistent_metric["report_sha256"] = inconsistent_metric_sha
+            inconsistent_metric_path = root / f"holdout-{inconsistent_metric_sha[:16]}.json"
+            write_immutable(
+                inconsistent_metric_path,
+                canonical_json(inconsistent_metric) + b"\n",
+            )
+            with self.assertRaisesRegex(ValueError, "cagr is inconsistent"):
+                _verified_holdout_report_artifact(inconsistent_metric_path)
 
             gate_failed = dict(report)
             gate_failed.pop("report_sha256")
             gate_failed["status"] = "NOT_PROVEN"
+            gate_failed["gates"] = dict(gate_failed["gates"])
+            gate_failed["gates"]["holdout_sharpe"] = False
             gate_failed_sha = hashlib.sha256(canonical_json(gate_failed)).hexdigest()
             gate_failed["report_sha256"] = gate_failed_sha
             gate_failed_path = root / f"holdout-{gate_failed_sha[:16]}.json"
@@ -337,6 +479,9 @@ class ReceiptIntegrityTests(unittest.TestCase):
                 "class EnvironmentTest(unittest.TestCase):\n"
                 "    def test_secret_is_absent(self):\n"
                 "        self.assertNotIn('BEN_TEST_SECRET', os.environ)\n\n"
+                "    def test_temp_root_is_cross_platform_and_pinned(self):\n"
+                "        self.assertEqual(os.environ['TEMP'], os.environ['TMP'])\n"
+                "        self.assertEqual(os.environ['TEMP'], os.environ['TMPDIR'])\n\n"
                 "    def test_local_path_is_redacted(self):\n"
                 "        local_path = os.path.join(os.environ['TEMP'], 'private')\n"
                 "        self.skipTest(repr(local_path))\n",
@@ -362,8 +507,12 @@ class ReceiptIntegrityTests(unittest.TestCase):
                 encoding="utf-8",
             )
             selection = _selection(root)
+            parent_environment = os.environ.copy()
+            for key in ("TEMP", "TMP", "TMPDIR"):
+                parent_environment.pop(key, None)
+            parent_environment["BEN_TEST_SECRET"] = "must-not-propagate"
             try:
-                with patch.dict(os.environ, {"BEN_TEST_SECRET": "must-not-propagate"}):
+                with patch.dict(os.environ, parent_environment, clear=True):
                     receipt_path = create_test_receipt(root, selection, config)
             except RuntimeError as exc:
                 logs = list((root / "artifacts").glob("test-log-*.txt"))
@@ -376,10 +525,9 @@ class ReceiptIntegrityTests(unittest.TestCase):
 
             log = root / receipt["normalized_output_path"]
             log_text = log.read_text(encoding="utf-8")
-            for key in ("TEMP", "TMP"):
-                if value := os.environ.get(key):
-                    self.assertNotIn(value, log_text)
-                    self.assertNotIn(repr(value)[1:-1], log_text)
+            audit_temp_root = root / "artifacts" / ".audit-tmp"
+            self.assertNotIn(str(audit_temp_root), log_text)
+            self.assertNotIn(repr(str(audit_temp_root))[1:-1], log_text)
             self.assertIn("<REDACTED_LOCAL_PATH>", log_text)
             log.write_bytes(log.read_bytes() + b"tampered\n")
             with self.assertRaises(ValueError):

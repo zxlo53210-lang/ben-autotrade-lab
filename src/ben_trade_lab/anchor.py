@@ -16,6 +16,7 @@ from .config import canonical_json
 from .integrity import fsync_directory, is_sha256
 
 STORE_SCHEMA_VERSION = "1.0.0"
+ANCHOR_RECORD_SCHEMA_VERSION = "1.1.0"
 STORE_TYPE = "BEN_AUTOTRADE_EXTERNAL_ANCHOR_STORE"
 STORE_POLICY = "CREATE_ONLY_PER_EXPERIMENT_HASH_CHAIN_V1"
 ANCHOR_TYPE = "BEN_AUTOTRADE_EXTERNAL_ANCHOR"
@@ -39,10 +40,30 @@ OPENED_STATE_BASE_FIELDS = frozenset(
         "experiment_id",
         "previous_state_sha256",
         "selection_sha256",
+        "config_sha256",
+        "source_tree_sha256",
+        "preholdout_manifest_sha256",
+        "preholdout_partition_descriptor_sha256",
+        "locked_partition_descriptor_sha256",
+        "parent_manifest_sha256",
+        "lockbox_id",
+        "preholdout_data_sha256",
+        "holdout_commitment_sha256",
         "holdout_manifest_sha256",
         "test_receipt_sha256",
         "review_receipt_sha256",
         "opened_at_utc",
+        "opening_commitment_sha256",
+        "external_anchor_store_id",
+        "external_anchor_store_sha256",
+        "witness_policy",
+        "witness_store_id",
+        "witness_header_sha256",
+        "witness_filesystem_device",
+        "witness_filesystem_inode",
+        "witness_burn_sequence",
+        "witness_burn_sha256",
+        "witness_burned_at_utc",
     }
 )
 ANCHOR_FIELDS = frozenset(
@@ -53,6 +74,7 @@ ANCHOR_FIELDS = frozenset(
         "sequence",
         "previous_anchor_sha256",
         "anchor_store_id",
+        "anchor_store_sha256",
         "experiment_id",
         "opened_at_utc",
         "opened_state_base_sha256",
@@ -65,6 +87,15 @@ ANCHOR_FIELDS = frozenset(
         "holdout_manifest_sha256",
         "test_receipt_sha256",
         "review_receipt_sha256",
+        "opening_commitment_sha256",
+        "witness_policy",
+        "witness_store_id",
+        "witness_header_sha256",
+        "witness_filesystem_device",
+        "witness_filesystem_inode",
+        "witness_burn_sequence",
+        "witness_burn_sha256",
+        "witness_burned_at_utc",
         "authority",
         "capability",
         "anchor_sha256",
@@ -269,15 +300,31 @@ def _validate_opened_base(value: Mapping[str, Any]) -> None:
         raise ValueError("HOLDOUT_OPENED_BASE_EXPERIMENT_ID_MALFORMED")
     if not _is_utc_timestamp(value.get("opened_at_utc")):
         raise ValueError("HOLDOUT_OPENED_BASE_OPENED_AT_INVALID")
+    if not _is_utc_timestamp(value.get("witness_burned_at_utc")):
+        raise ValueError("HOLDOUT_OPENED_BASE_WITNESS_BURNED_AT_INVALID")
+    if value.get("witness_burned_at_utc") != value.get("opened_at_utc"):
+        raise ValueError("HOLDOUT_OPENED_BASE_TIMESTAMPS_MISMATCH")
+    for field in ("witness_filesystem_device", "witness_burn_sequence"):
+        item = value.get(field)
+        if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+            raise ValueError(f"HOLDOUT_OPENED_BASE_{field.upper()}_INVALID")
+    inode = value.get("witness_filesystem_inode")
+    if not isinstance(inode, int) or isinstance(inode, bool) or inode <= 0:
+        raise ValueError("HOLDOUT_OPENED_BASE_WITNESS_FILESYSTEM_INODE_INVALID")
+    if int(value["witness_burn_sequence"]) <= 0:
+        raise ValueError("HOLDOUT_OPENED_BASE_WITNESS_BURN_SEQUENCE_INVALID")
+    if value.get("witness_policy") != "LINUX_FS_APPEND_FL_ONE_SHOT_BURN_LEDGER_V1":
+        raise ValueError("HOLDOUT_OPENED_BASE_WITNESS_POLICY_MISMATCH")
 
 
 def _validate_anchor_record(
     value: Mapping[str, Any],
     *,
     expected_store_id: str,
+    expected_store_sha256: str,
     expected_experiment_id: str,
 ) -> None:
-    if value.get("schema_version") != STORE_SCHEMA_VERSION:
+    if value.get("schema_version") != ANCHOR_RECORD_SCHEMA_VERSION:
         raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_SCHEMA_VERSION_MISMATCH")
     if value.get("type") != ANCHOR_TYPE or value.get("event") != ANCHOR_EVENT:
         raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_TYPE_OR_EVENT_MISMATCH")
@@ -287,6 +334,8 @@ def _validate_anchor_record(
         raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_PREVIOUS_HASH_MISMATCH")
     if value.get("anchor_store_id") != expected_store_id:
         raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_STORE_ID_MISMATCH")
+    if value.get("anchor_store_sha256") != expected_store_sha256:
+        raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_STORE_SHA256_MISMATCH")
     if value.get("experiment_id") != expected_experiment_id:
         raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_EXPERIMENT_ID_MISMATCH")
     for field in ANCHOR_FIELDS:
@@ -296,6 +345,21 @@ def _validate_anchor_record(
         raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_STORE_ID_MALFORMED")
     if not _is_utc_timestamp(value.get("opened_at_utc")):
         raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_OPENED_AT_INVALID")
+    if not _is_utc_timestamp(value.get("witness_burned_at_utc")):
+        raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_WITNESS_BURNED_AT_INVALID")
+    if value.get("witness_burned_at_utc") != value.get("opened_at_utc"):
+        raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_TIMESTAMPS_MISMATCH")
+    for field in ("witness_filesystem_device", "witness_burn_sequence"):
+        item = value.get(field)
+        if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+            raise ExternalAnchorCorruption(f"EXTERNAL_ANCHOR_{field.upper()}_INVALID")
+    inode = value.get("witness_filesystem_inode")
+    if not isinstance(inode, int) or isinstance(inode, bool) or inode <= 0:
+        raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_WITNESS_FILESYSTEM_INODE_INVALID")
+    if int(value["witness_burn_sequence"]) <= 0:
+        raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_WITNESS_BURN_SEQUENCE_INVALID")
+    if value.get("witness_policy") != "LINUX_FS_APPEND_FL_ONE_SHOT_BURN_LEDGER_V1":
+        raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_WITNESS_POLICY_MISMATCH")
     if value.get("authority") != "RESEARCH_ONLY_ZERO_LIVE_AUTHORITY":
         raise ExternalAnchorCorruption("EXTERNAL_ANCHOR_AUTHORITY_MISMATCH")
     if value.get("capability") != "LIVE_DISABLED":
@@ -308,7 +372,7 @@ def _record_path(root: Path, experiment_id: str) -> Path:
     return root / "records" / experiment_id[:2] / experiment_id / ANCHOR_RECORD_NAME
 
 
-def _verify_record_tree(root: Path, store_id: str) -> None:
+def _verify_record_tree(root: Path, store_id: str, store_sha256: str) -> None:
     records = root / "records"
     _require_directory(records, "ANCHOR_RECORDS_DIRECTORY")
     for shard in records.iterdir():
@@ -343,6 +407,7 @@ def _verify_record_tree(root: Path, store_id: str) -> None:
             _validate_anchor_record(
                 record,
                 expected_store_id=store_id,
+                expected_store_sha256=store_sha256,
                 expected_experiment_id=experiment.name,
             )
 
@@ -437,7 +502,7 @@ def verify_anchor_store(
         label="ANCHOR_STORE",
     )
     _validate_store_descriptor(descriptor, expected_store_id, expected_store_sha256)
-    _verify_record_tree(root, expected_store_id)
+    _verify_record_tree(root, expected_store_id, expected_store_sha256)
     return ExternalAnchorStore(
         root=root,
         repository_root=repository,
@@ -467,6 +532,7 @@ def read_holdout_opened_anchor(
     _validate_anchor_record(
         value,
         expected_store_id=current.store_id,
+        expected_store_sha256=current.store_sha256,
         expected_experiment_id=experiment_id,
     )
     return value
@@ -522,15 +588,27 @@ def commit_holdout_opened_anchor(
     ):
         if not is_sha256(value):
             raise ValueError(f"EXTERNAL_ANCHOR_{field.upper()}_MALFORMED")
+    expected_opened_bindings = {
+        "external_anchor_store_id": current.store_id,
+        "external_anchor_store_sha256": current.store_sha256,
+        "config_sha256": config_sha256,
+        "source_tree_sha256": source_tree_sha256,
+        "preholdout_data_sha256": preholdout_data_sha256,
+        "holdout_commitment_sha256": holdout_commitment_sha256,
+    }
+    for field, expected in expected_opened_bindings.items():
+        if opened.get(field) != expected:
+            raise ValueError(f"HOLDOUT_OPENED_BASE_{field.upper()}_MISMATCH")
     assert_holdout_unopened(current, experiment_id)
 
     unsigned = {
-        "schema_version": STORE_SCHEMA_VERSION,
+        "schema_version": ANCHOR_RECORD_SCHEMA_VERSION,
         "type": ANCHOR_TYPE,
         "event": ANCHOR_EVENT,
         "sequence": 0,
         "previous_anchor_sha256": GENESIS_ANCHOR_SHA256,
         "anchor_store_id": current.store_id,
+        "anchor_store_sha256": current.store_sha256,
         "experiment_id": experiment_id,
         "opened_at_utc": opened["opened_at_utc"],
         "opened_state_base_sha256": hashlib.sha256(canonical_json(opened)).hexdigest(),
@@ -543,6 +621,15 @@ def commit_holdout_opened_anchor(
         "holdout_manifest_sha256": opened["holdout_manifest_sha256"],
         "test_receipt_sha256": opened["test_receipt_sha256"],
         "review_receipt_sha256": opened["review_receipt_sha256"],
+        "opening_commitment_sha256": opened["opening_commitment_sha256"],
+        "witness_policy": opened["witness_policy"],
+        "witness_store_id": opened["witness_store_id"],
+        "witness_header_sha256": opened["witness_header_sha256"],
+        "witness_filesystem_device": opened["witness_filesystem_device"],
+        "witness_filesystem_inode": opened["witness_filesystem_inode"],
+        "witness_burn_sequence": opened["witness_burn_sequence"],
+        "witness_burn_sha256": opened["witness_burn_sha256"],
+        "witness_burned_at_utc": opened["witness_burned_at_utc"],
         "authority": "RESEARCH_ONLY_ZERO_LIVE_AUTHORITY",
         "capability": "LIVE_DISABLED",
     }

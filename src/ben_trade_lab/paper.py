@@ -5,6 +5,7 @@ import json
 import math
 import os
 import stat
+import statistics
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -12,7 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from .anchor import read_holdout_opened_anchor, verify_anchor_store
-from .config import LabConfig, canonical_json
+from .config import LabConfig, canonical_json, parse_utc_ms
+from .data import (
+    HOUR_MS,
+    bind_manifest_to_config,
+    load_bars_from_manifest,
+    read_manifest_metadata,
+)
 from .integrity import (
     fsync_directory,
     is_link_or_reparse,
@@ -23,30 +30,38 @@ from .integrity import (
     verified_hashed_object,
     write_immutable,
 )
+from .metrics import buy_and_hold_metrics
 from .validation import (
+    BENCHMARK_PROTOCOL,
     FINALIZED_STATE_FIELDS,
     FROZEN_STATE_FIELDS,
+    HOLDOUT_GATE_FIELDS,
+    HOLDOUT_REPORT_SCHEMA_VERSION,
+    MAX_HOLDOUT_CONTEXT_HOURS,
     OPENED_STATE_FIELDS,
+    _apply_exact_window_duration,
+    _assumptions,
+    _build_opened_state_base,
+    _deserialize_bar,
+    _is_adjacent,
+    _opened_state_base,
+    _opening_commitment_sha256,
+    _params,
+    _preholdout_candidate_eligible,
     _read_canonical_state,
     _require_anchor_matches_opened,
     _require_config_anchor_store_id,
+    _require_witness_burn_matches_opened,
+    _select_primary_candidate,
+    _validate_performance_metrics,
     _verified_holdout_report_artifact,
     _verified_selection_artifact,
+    _verify_configured_witness,
+    _window_result,
 )
 
 GENESIS_HASH = "0" * 64
-REQUIRED_HOLDOUT_GATES = {
-    "holdout_sharpe",
-    "holdout_calmar",
-    "holdout_drawdown",
-    "completed_round_trips",
-    "required_cost_stress_return_positive",
-    "walk_forward_positive_fraction",
-    "holdout_parameter_neighbors_positive",
-    "mark_to_market_profit_concentration",
-    "source_bound_tests",
-    "independent_pro_review",
-}
+REQUIRED_HOLDOUT_GATES = HOLDOUT_GATE_FIELDS
 
 
 def _event_hash(event_without_hash: dict[str, Any]) -> str:
@@ -322,6 +337,431 @@ def _require_fields(value: dict[str, Any], expected: dict[str, Any], label: str)
             raise ValueError(f"{label} {field} mismatch")
 
 
+def _finite_report_number(value: object, label: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+    ):
+        raise ValueError(f"{label} must be finite")
+    return float(value)
+
+
+def _numbers_equal(left: object, right: object) -> bool:
+    try:
+        left_value = _finite_report_number(left, "left comparison value")
+        right_value = _finite_report_number(right, "right comparison value")
+    except ValueError:
+        return False
+    return math.isclose(left_value, right_value, rel_tol=1e-12, abs_tol=1e-12)
+
+
+def _require_metric_window(
+    metrics: dict[str, Any],
+    *,
+    label: str,
+    start_ms: int,
+    end_ms_exclusive: int,
+    initial_cash: float,
+) -> None:
+    expected_points = (end_ms_exclusive - start_ms) // HOUR_MS
+    exact = {
+        "start_open_time_ms": start_ms,
+        "end_open_time_ms": end_ms_exclusive - HOUR_MS,
+        "equity_points": expected_points,
+    }
+    _require_fields(metrics, exact, label)
+    if not _numbers_equal(metrics.get("elapsed_hours"), float(expected_points)):
+        raise ValueError(f"{label} elapsed_hours mismatch")
+    if not _numbers_equal(metrics.get("initial_cash"), initial_cash):
+        raise ValueError(f"{label} initial_cash mismatch")
+
+
+def _require_frozen_report_semantics(
+    report: dict[str, Any], selection: dict[str, Any], config: LabConfig
+) -> None:
+    """Recompute every PAPER-authorizing gate from frozen report inputs."""
+
+    selected_params = report["selected_params"]
+    grid = config.strategy_grid()
+    if sum(params.as_dict() == selected_params for params in grid) != 1:
+        raise ValueError("paper report selected params are outside the frozen grid")
+    expected_neighbors = [
+        params.as_dict()
+        for params in grid
+        if params.as_dict() != selected_params
+        and _is_adjacent(selected_params, params.as_dict(), grid)
+    ]
+    frozen_neighbors = selection.get("selected_parameter_neighbors")
+    if frozen_neighbors != expected_neighbors:
+        raise ValueError("paper selection frozen neighbor set mismatch")
+    frozen_neighbor_count = selection.get("preholdout_neighbor_count")
+    if (
+        not isinstance(frozen_neighbor_count, int)
+        or isinstance(frozen_neighbor_count, bool)
+        or frozen_neighbor_count != len(expected_neighbors)
+    ):
+        raise ValueError("paper selection frozen neighbor count mismatch")
+
+    report_neighbors = report["holdout_parameter_neighbors"]
+    if [item["params"] for item in report_neighbors] != expected_neighbors:
+        raise ValueError("paper report holdout neighbor set mismatch")
+    protocol = report["holdout_parameter_neighbor_protocol"]
+    if protocol != {
+        "primary_excluded": True,
+        "replacement_allowed": False,
+        "exact_frozen_neighbor_count": len(expected_neighbors),
+    }:
+        raise ValueError("paper report holdout neighbor protocol mismatch")
+    neighbor_fraction = (
+        sum(float(item["metrics"]["total_return"]) > 0.0 for item in report_neighbors)
+        / len(report_neighbors)
+        if report_neighbors
+        else 0.0
+    )
+    if not _numbers_equal(
+        report.get("holdout_parameter_neighbor_positive_fraction"), neighbor_fraction
+    ):
+        raise ValueError("paper report holdout neighbor fraction mismatch")
+    preholdout_neighbor_fraction = _finite_report_number(
+        selection.get("preholdout_neighbor_positive_fraction"),
+        "paper selection preholdout neighbor fraction",
+    )
+    if not 0.0 <= preholdout_neighbor_fraction <= 1.0 or not _numbers_equal(
+        report.get("preholdout_parameter_neighbor_fraction"),
+        preholdout_neighbor_fraction,
+    ):
+        raise ValueError("paper report preholdout neighbor fraction mismatch")
+
+    holdout_start = parse_utc_ms(config.splits["validation_end_utc_exclusive"])
+    holdout_end = parse_utc_ms(config.splits["locked_holdout_end_utc_exclusive"])
+    indicator_context = max(
+        int(selected_params[field])
+        for field in (
+            "entry_lookback",
+            "exit_lookback",
+            "trend_lookback",
+            "volatility_lookback",
+        )
+    )
+    if report["holdout"] != {
+        "start_ms": holdout_start,
+        "end_ms_exclusive": holdout_end,
+        "account_state": "RESET_TO_INITIAL_CASH",
+        "strategy_state": "RESET_FIRST_SIGNAL_FROM_HOLDOUT",
+        "indicator_context_hours": indicator_context,
+    }:
+        raise ValueError("paper report holdout protocol mismatch")
+    if report.get("benchmark_protocol") != BENCHMARK_PROTOCOL:
+        raise ValueError("paper report benchmark protocol mismatch")
+
+    initial_cash = float(config.execution["initial_cash"])
+    metric_sets: list[tuple[str, dict[str, Any]]] = [
+        ("paper report metrics", report["metrics"]),
+        ("paper report benchmark metrics", report["benchmark_buy_and_hold"]),
+        ("paper report latency metrics", report["latency_stress"]["metrics"]),
+    ]
+    metric_sets.extend(
+        (f"paper report cost stress {key}", metrics)
+        for key, metrics in report["cost_stress"].items()
+    )
+    metric_sets.extend(
+        (f"paper report neighbor {index} metrics", item["metrics"])
+        for index, item in enumerate(report_neighbors)
+    )
+    for label, metrics in metric_sets:
+        _require_metric_window(
+            metrics,
+            label=label,
+            start_ms=holdout_start,
+            end_ms_exclusive=holdout_end,
+            initial_cash=initial_cash,
+        )
+
+    required_multiplier = float(
+        config.acceptance["minimum_positive_cost_stress_multiplier"]
+    )
+    required_cost_key = f"{required_multiplier:g}x"
+    expected_cost_keys = {required_cost_key, "3x"}
+    if set(report["cost_stress"]) != expected_cost_keys:
+        raise ValueError("paper report cost stress multipliers mismatch")
+    latency_delay = int(config.raw["diagnostics"]["latency_stress_delay_bars"])
+    if report["latency_stress"]["signal_delay_bars"] != latency_delay:
+        raise ValueError("paper report latency stress delay mismatch")
+
+    candidates = selection.get("candidates")
+    if not isinstance(candidates, list):
+        raise TypeError("paper selection candidates are malformed")
+    selected_candidates = [
+        item
+        for item in candidates
+        if isinstance(item, dict) and item.get("params") == selected_params
+    ]
+    if len(selected_candidates) != 1:
+        raise ValueError("paper selection must contain the primary exactly once")
+    positive_fold_fraction = _finite_report_number(
+        selected_candidates[0].get("positive_fold_fraction"),
+        "paper selection positive fold fraction",
+    )
+    if not 0.0 <= positive_fold_fraction <= 1.0:
+        raise ValueError("paper selection positive fold fraction is outside [0, 1]")
+
+    base = report["metrics"]
+    base_calmar = base.get("calmar")
+    calmar_gate = (
+        isinstance(base_calmar, (int, float))
+        and not isinstance(base_calmar, bool)
+        and math.isfinite(float(base_calmar))
+        and float(base_calmar) >= float(config.acceptance["minimum_holdout_calmar"])
+    )
+    recomputed_gates = {
+        "holdout_sharpe": float(base["annualized_sharpe_daily"])
+        >= float(config.acceptance["minimum_holdout_sharpe"]),
+        "holdout_calmar": calmar_gate,
+        "holdout_drawdown": float(base["maximum_drawdown"])
+        >= -float(config.acceptance["maximum_holdout_drawdown"]),
+        "completed_round_trips": int(base["completed_round_trips"])
+        >= int(config.acceptance["minimum_completed_round_trips"]),
+        "required_cost_stress_return_positive": float(
+            report["cost_stress"][required_cost_key]["total_return"]
+        )
+        > 0.0,
+        "walk_forward_positive_fraction": positive_fold_fraction
+        >= float(config.raw["selection"]["minimum_positive_fold_fraction"]),
+        "holdout_parameter_neighbors_positive": neighbor_fraction
+        >= float(config.acceptance["minimum_positive_parameter_neighbors_fraction"]),
+        "mark_to_market_profit_concentration": float(
+            base["maximum_positive_quarter_mark_to_market_profit_concentration"]
+        )
+        <= float(config.acceptance["maximum_single_quarter_profit_concentration"]),
+        "source_bound_tests": True,
+        "independent_pro_review": True,
+    }
+    if report.get("gates") != recomputed_gates:
+        raise ValueError("paper report gates do not match frozen metrics and thresholds")
+    if not all(recomputed_gates.values()):
+        raise ValueError("paper report does not independently pass every frozen gate")
+
+
+def _require_recomputed_locked_report(
+    root: Path,
+    report: dict[str, Any],
+    selection: dict[str, Any],
+    config: LabConfig,
+    locked_metadata: dict[str, Any],
+) -> None:
+    """Re-run every reported OOS scenario before granting PAPER authority."""
+
+    holdout_bars, holdout_manifest = load_bars_from_manifest(
+        selection["locked_holdout_manifest_path"],
+        root=root,
+        expected_kind="LOCKED_HOLDOUT",
+        allow_locked_data=True,
+    )
+    bind_manifest_to_config(holdout_manifest, config, "LOCKED_HOLDOUT")
+    if holdout_manifest != locked_metadata:
+        raise ValueError("paper locked manifest changed after metadata verification")
+    context = [_deserialize_bar(value) for value in selection["warmup_context"]]
+    if not context or len(context) > MAX_HOLDOUT_CONTEXT_HOURS:
+        raise ValueError("paper frozen warmup context is invalid")
+    selected = _params(selection["selected_params"])
+    holdout_start = parse_utc_ms(config.splits["validation_end_utc_exclusive"])
+    holdout_end = parse_utc_ms(config.splits["locked_holdout_end_utc_exclusive"])
+    bars = context + holdout_bars
+    base = _window_result(
+        bars,
+        selected,
+        _assumptions(config),
+        holdout_start,
+        holdout_end,
+    )
+    required_multiplier = float(
+        config.acceptance["minimum_positive_cost_stress_multiplier"]
+    )
+    expected_cost_stress = {
+        f"{required_multiplier:g}x": _window_result(
+            bars,
+            selected,
+            _assumptions(config, required_multiplier),
+            holdout_start,
+            holdout_end,
+        ),
+        "3x": _window_result(
+            bars,
+            selected,
+            _assumptions(config, 3.0),
+            holdout_start,
+            holdout_end,
+        ),
+    }
+    latency_delay = int(config.raw["diagnostics"]["latency_stress_delay_bars"])
+    expected_latency = {
+        "signal_delay_bars": latency_delay,
+        "metrics": _window_result(
+            bars,
+            selected,
+            _assumptions(config, signal_delay_bars=latency_delay),
+            holdout_start,
+            holdout_end,
+        ),
+    }
+    expected_neighbors = [
+        {
+            "params": value,
+            "metrics": _window_result(
+                bars,
+                _params(value),
+                _assumptions(config),
+                holdout_start,
+                holdout_end,
+            ),
+        }
+        for value in selection["selected_parameter_neighbors"]
+    ]
+    expected_neighbor_fraction = (
+        sum(item["metrics"]["total_return"] > 0 for item in expected_neighbors)
+        / len(expected_neighbors)
+        if expected_neighbors
+        else 0.0
+    )
+    expected_benchmark = _apply_exact_window_duration(
+        buy_and_hold_metrics(holdout_bars, _assumptions(config)),
+        holdout_start,
+        holdout_end,
+    )
+    gap_events = [
+        item
+        for item in holdout_manifest.get("declared_source_anomalies", [])
+        if item.get("type") == "MISSING_HOURLY_BARS"
+    ]
+    expected = {
+        "metrics": base,
+        "cost_stress": expected_cost_stress,
+        "latency_stress": expected_latency,
+        "holdout_parameter_neighbors": expected_neighbors,
+        "holdout_parameter_neighbor_positive_fraction": expected_neighbor_fraction,
+        "benchmark_buy_and_hold": expected_benchmark,
+        "holdout_gap_events": len(gap_events),
+        "holdout_missing_hours": sum(
+            int(item["missing_bar_count"]) for item in gap_events
+        ),
+    }
+    for field, expected_value in expected.items():
+        if report.get(field) != expected_value:
+            raise ValueError(f"paper report {field} differs from deterministic replay")
+
+
+def _require_recomputed_selection_aggregates(
+    selection: dict[str, Any],
+    config: LabConfig,
+) -> None:
+    candidates = selection.get("candidates")
+    if not isinstance(candidates, list):
+        raise TypeError("paper selection candidates are malformed")
+    grid = config.strategy_grid()
+    expected_params = [item.as_dict() for item in grid]
+    if (
+        selection.get("trial_count") != len(candidates)
+        or len(candidates) != int(config.raw["selection"]["maximum_trials"])
+    ):
+        raise ValueError("paper selection trial count mismatch")
+    candidate_fields = {
+        "params",
+        "eligible",
+        "folds",
+        "median_calmar",
+        "median_sharpe",
+        "median_total_return",
+        "positive_fold_fraction",
+        "continuous_daily_returns",
+    }
+    minimum_trips = int(
+        config.raw["selection"]["minimum_fold_completed_round_trips"]
+    )
+    minimum_exposure = float(
+        config.raw["selection"]["minimum_fold_exposure_fraction"]
+    )
+    maximum_exposure = float(
+        config.raw["selection"]["maximum_fold_exposure_fraction"]
+    )
+    minimum_positive = float(
+        config.raw["selection"]["minimum_positive_fold_fraction"]
+    )
+    for index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict) or set(candidate) != candidate_fields:
+            raise ValueError("paper selection candidate schema mismatch")
+        if candidate["params"] != expected_params[index]:
+            raise ValueError("paper selection candidate grid/order mismatch")
+        folds = candidate.get("folds")
+        if not isinstance(folds, list) or len(folds) != int(
+            config.raw["selection"]["expected_fold_count"]
+        ):
+            raise ValueError("paper selection fold count mismatch")
+        for fold_number, fold in enumerate(folds, start=1):
+            if not isinstance(fold, dict) or set(fold) != {
+                "fold_number",
+                "start_ms",
+                "end_ms_exclusive",
+                "account_boundary",
+                "metrics",
+            }:
+                raise ValueError("paper selection fold schema mismatch")
+            if fold.get("fold_number") != fold_number:
+                raise ValueError("paper selection fold numbering mismatch")
+            _validate_performance_metrics(
+                fold.get("metrics"),
+                f"paper selection candidate {index} fold {fold_number}",
+            )
+        returns = [float(item["metrics"]["total_return"]) for item in folds]
+        sharpes = [float(item["metrics"]["annualized_sharpe_daily"]) for item in folds]
+        calmars = [item["metrics"]["calmar"] for item in folds]
+        positive_fraction = sum(value > 0.0 for value in returns) / len(returns)
+        eligible = _preholdout_candidate_eligible(
+            folds,
+            minimum_trips=minimum_trips,
+            minimum_exposure=minimum_exposure,
+            maximum_exposure=maximum_exposure,
+            minimum_positive_fraction=minimum_positive,
+        )
+        expected_scalars = {
+            "eligible": eligible,
+            "median_calmar": statistics.median(calmars) if eligible else None,
+            "median_sharpe": statistics.median(sharpes),
+            "median_total_return": statistics.median(returns),
+            "positive_fold_fraction": positive_fraction,
+        }
+        for field, expected in expected_scalars.items():
+            if candidate.get(field) != expected:
+                raise ValueError(f"paper selection candidate {field} mismatch")
+    if selection.get("fold_count") != int(config.raw["selection"]["expected_fold_count"]):
+        raise ValueError("paper selection declared fold count mismatch")
+    selected = _select_primary_candidate(candidates)
+    if selected is None or selected["params"] != selection.get("selected_params"):
+        raise ValueError("paper selection primary candidate mismatch")
+    expected_neighbors = [
+        item
+        for item in candidates
+        if _is_adjacent(selection["selected_params"], item["params"], grid)
+    ]
+    if selection.get("selected_parameter_neighbors") != [
+        item["params"] for item in expected_neighbors
+    ]:
+        raise ValueError("paper selection neighbor set mismatch")
+    expected_neighbor_fraction = (
+        sum(item["eligible"] and item["median_total_return"] > 0 for item in expected_neighbors)
+        / len(expected_neighbors)
+        if expected_neighbors
+        else 0.0
+    )
+    if not math.isclose(
+        float(selection.get("preholdout_neighbor_positive_fraction", -1.0)),
+        expected_neighbor_fraction,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("paper selection neighbor fraction mismatch")
+
+
 def _verified_finalized_report(
     root: Path,
     report_path: str | Path,
@@ -329,6 +769,8 @@ def _verified_finalized_report(
     *,
     anchor_root: str | Path,
     anchor_store_id: str,
+    witness_ledger: str | Path,
+    witness_store_id: str,
 ) -> dict[str, Any]:
     _require_config_anchor_store_id(config, anchor_store_id)
     supplied_path = Path(report_path)
@@ -347,7 +789,7 @@ def _verified_finalized_report(
     _require_fields(
         report,
         {
-            "schema_version": "1.2.0",
+            "schema_version": HOLDOUT_REPORT_SCHEMA_VERSION,
             "status": "BACKTEST_CANDIDATE",
             "capability": "LIVE_DISABLED",
             "authority": "RESEARCH_ONLY_ZERO_LIVE_AUTHORITY",
@@ -379,11 +821,36 @@ def _verified_finalized_report(
             "selection_sha256": report.get("selection_sha256"),
             "config_sha256": report.get("config_sha256"),
             "source_tree_sha256": report.get("source_tree_sha256"),
+            "locked_holdout_manifest_sha256": report.get("holdout_manifest_sha256"),
             "holdout_commitment_sha256": report.get("holdout_data_sha256"),
             "selected_params": report.get("selected_params"),
         },
         "paper selection",
     )
+    _require_recomputed_selection_aggregates(selection, config)
+    locked_metadata = read_manifest_metadata(
+        selection["locked_holdout_manifest_path"],
+        root=root,
+    )
+    bind_manifest_to_config(locked_metadata, config, "LOCKED_HOLDOUT")
+    locked_bindings = {
+        "manifest_path": selection["locked_holdout_manifest_path"],
+        "manifest_file_sha256": selection["locked_holdout_manifest_sha256"],
+        "partition_descriptor_sha256": selection[
+            "locked_partition_descriptor_sha256"
+        ],
+        "paired_partition_kind": "PREHOLDOUT",
+        "paired_partition_descriptor_sha256": selection[
+            "preholdout_partition_descriptor_sha256"
+        ],
+        "lockbox_id": selection["lockbox_id"],
+        "normalized_sha256": selection["holdout_commitment_sha256"],
+        "preholdout_sha256": selection["preholdout_data_sha256"],
+        "parent_manifest_sha256": selection["parent_manifest_sha256"],
+    }
+    for field, expected in locked_bindings.items():
+        if locked_metadata.get(field) != expected:
+            raise ValueError(f"paper locked holdout manifest {field} mismatch")
 
     test_file = _artifact(root, "test-receipt", report.get("test_receipt_sha256"))
     review_file = _artifact(root, "pro-review-receipt", report.get("review_receipt_sha256"))
@@ -410,6 +877,7 @@ def _verified_finalized_report(
         {"type": "PRO_REVIEW_RECEIPT", "verdict": "PROCEED", **receipt_binding},
         "Pro review receipt",
     )
+    _require_frozen_report_semantics(report, selection, config)
 
     experiment_id = report.get("experiment_id")
     if not is_sha256(experiment_id):
@@ -478,6 +946,43 @@ def _verified_finalized_report(
         expected_store_id=anchor_store_id,
         expected_store_sha256=str(config.raw["anchor"]["store_sha256"]),
     )
+    witness = _verify_configured_witness(
+        witness_ledger,
+        witness_store_id=witness_store_id,
+        config=config,
+        root=root,
+    )
+    opening_burn = witness.burn_for(str(experiment_id))
+    if opening_burn is None:
+        raise ValueError("paper authorization has no append-only opening burn")
+    opening_commitment = _opening_commitment_sha256(
+        selection=selection,
+        frozen=frozen,
+        metadata=locked_metadata,
+        test_receipt=test_receipt,
+        review_receipt=review_receipt,
+        config=config,
+        anchor_store_id=anchor_store.store_id,
+        anchor_store_sha256=anchor_store.store_sha256,
+        witness=witness,
+        opened_at_utc=opened["opened_at_utc"],
+    )
+    expected_opened_base = _build_opened_state_base(
+        selection=selection,
+        frozen=frozen,
+        metadata=locked_metadata,
+        test_receipt=test_receipt,
+        review_receipt=review_receipt,
+        config=config,
+        anchor_store_id=anchor_store.store_id,
+        anchor_store_sha256=anchor_store.store_sha256,
+        witness=witness,
+        burn=opening_burn,
+        opening_commitment_sha256=opening_commitment,
+    )
+    if _opened_state_base(opened) != expected_opened_base:
+        raise ValueError("paper HOLDOUT_OPENED base does not match the frozen opening plan")
+    _require_witness_burn_matches_opened(witness, opening_burn, opened)
     external_anchor = read_holdout_opened_anchor(anchor_store, str(experiment_id))
     _require_anchor_matches_opened(
         opened,
@@ -488,6 +993,20 @@ def _verified_finalized_report(
         preholdout_data_sha256=selection["preholdout_data_sha256"],
         holdout_commitment_sha256=selection["holdout_commitment_sha256"],
     )
+    report_provenance = {
+        "holdout_opened_state_sha256": opened["state_sha256"],
+        "opening_commitment_sha256": opened["opening_commitment_sha256"],
+        "external_anchor_store_id": anchor_store.store_id,
+        "external_anchor_store_sha256": anchor_store.store_sha256,
+        "external_anchor_sha256": external_anchor["anchor_sha256"],
+        "witness_store_id": witness.store_id,
+        "witness_header_sha256": witness.header_sha256,
+        "witness_filesystem_device": witness.filesystem_device,
+        "witness_filesystem_inode": witness.filesystem_inode,
+        "witness_burn_sequence": opening_burn.sequence,
+        "witness_burn_sha256": opening_burn.record_sha256,
+    }
+    _require_fields(report, report_provenance, "paper report opening provenance")
     _require_fields(
         finalized,
         {
@@ -500,6 +1019,31 @@ def _verified_finalized_report(
         },
         "FINALIZED state",
     )
+    finalization = witness.finalization_for(str(experiment_id))
+    if finalization is None:
+        raise ValueError("paper authorization has no append-only final report commitment")
+    finalization_expected = {
+        "experiment_id": str(experiment_id),
+        "opening_burn_record_sha256": opening_burn.record_sha256,
+        "opened_state_sha256": opened["state_sha256"],
+        "external_anchor_sha256": external_anchor["anchor_sha256"],
+        "report_sha256": report["report_sha256"],
+        "report_status": report["status"],
+        "report_kind": report["report_kind"],
+        "finalized_at_utc": finalized["finalized_at_utc"],
+        "sequence": finalized["witness_finalization_sequence"],
+        "record_sha256": finalized["witness_finalization_sha256"],
+    }
+    for field, expected in finalization_expected.items():
+        if getattr(finalization, field) != expected:
+            raise ValueError(f"paper witness finalization {field} mismatch")
+    _require_recomputed_locked_report(
+        root,
+        report,
+        selection,
+        config,
+        locked_metadata,
+    )
     return report
 
 
@@ -511,6 +1055,8 @@ def initialize_paper(
     *,
     anchor_root: str | Path,
     anchor_store_id: str,
+    witness_ledger: str | Path,
+    witness_store_id: str,
 ) -> dict[str, Any]:
     if not math.isfinite(capital) or capital <= 0:
         raise ValueError("paper capital must be finite and positive")
@@ -523,6 +1069,8 @@ def initialize_paper(
         config,
         anchor_root=anchor_root,
         anchor_store_id=anchor_store_id,
+        witness_ledger=witness_ledger,
+        witness_store_id=witness_store_id,
     )
     event = _append_event(
         journal,
@@ -537,6 +1085,10 @@ def initialize_paper(
             "config_sha256": config.config_sha256,
             "test_receipt_sha256": report["test_receipt_sha256"],
             "review_receipt_sha256": report["review_receipt_sha256"],
+            "holdout_opened_state_sha256": report["holdout_opened_state_sha256"],
+            "opening_commitment_sha256": report["opening_commitment_sha256"],
+            "external_anchor_sha256": report["external_anchor_sha256"],
+            "witness_burn_sha256": report["witness_burn_sha256"],
             "live_execution": "UNAVAILABLE",
         },
         require_empty=True,

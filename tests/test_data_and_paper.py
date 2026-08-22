@@ -5,7 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from test_paper_authorization import ANCHOR_STORE_ID, _complete_provenance
+from test_paper_authorization import (
+    ANCHOR_STORE_ID,
+    _complete_provenance,
+    initialize_paper,
+)
 
 from ben_trade_lab.config import canonical_json, load_config
 from ben_trade_lab.data import (
@@ -16,7 +20,7 @@ from ben_trade_lab.data import (
 )
 from ben_trade_lab.integrity import source_tree_sha256
 from ben_trade_lab.models import Bar
-from ben_trade_lab.paper import initialize_paper, paper_status, stop_paper, verify_journal
+from ben_trade_lab.paper import paper_status, stop_paper, verify_journal
 
 ROOT = Path(__file__).resolve().parents[1]
 

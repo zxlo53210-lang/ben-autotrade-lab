@@ -13,6 +13,7 @@ from .integrity import (
     MAX_SANITIZED_REVIEW_BYTES,
     fsync_directory,
     full_provenance_replay_evidence,
+    require_plain_parent_chain_for_create,
     resolve_regular_file_inside,
     source_tree_sha256,
     write_immutable,
@@ -26,8 +27,29 @@ SAFE_TEST_ENVIRONMENT_KEYS = (
     "SYSTEMROOT",
     "TEMP",
     "TMP",
+    "TMPDIR",
     "WINDIR",
 )
+
+AUDIT_TEMP_DIRECTORY = "artifacts/.audit-tmp"
+
+
+def _prepare_audit_temp_root(root_path: Path) -> Path:
+    """Create one repository-local temp root without following indirection."""
+
+    temp_root = root_path / AUDIT_TEMP_DIRECTORY
+    probe = temp_root / ".plain-directory-probe"
+    require_plain_parent_chain_for_create(probe, "audit temp root")
+    temp_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    require_plain_parent_chain_for_create(probe, "audit temp root")
+    if not temp_root.is_dir():
+        raise ValueError("audit temp root must be a plain directory")
+    resolved = temp_root.resolve()
+    try:
+        resolved.relative_to(root_path)
+    except ValueError as exc:
+        raise ValueError("audit temp root must stay inside the repository") from exc
+    return resolved
 
 
 def _redact_local_paths(
@@ -38,7 +60,7 @@ def _redact_local_paths(
     path_values = {str(root_path)}
     path_values.update(
         value
-        for key in ("TEMP", "TMP")
+        for key in ("TEMP", "TMP", "TMPDIR")
         if (value := environment.get(key))
     )
     variants: set[str] = set()
@@ -95,13 +117,15 @@ def create_test_receipt(root: str | Path, selection_path: str | Path, config: La
         selection_path, config, root_path
     )
     source_before = source_tree_sha256(root_path)
+    audit_temp_root = str(_prepare_audit_temp_root(root_path))
     environment_candidates = {
         "COMSPEC": os.environ.get("COMSPEC"),
         "PATH": os.environ.get("PATH"),
         "PATHEXT": os.environ.get("PATHEXT"),
         "SYSTEMROOT": os.environ.get("SYSTEMROOT"),
-        "TEMP": os.environ.get("TEMP"),
-        "TMP": os.environ.get("TMP"),
+        "TEMP": audit_temp_root,
+        "TMP": audit_temp_root,
+        "TMPDIR": audit_temp_root,
         "WINDIR": os.environ.get("WINDIR"),
     }
     if set(environment_candidates) != set(SAFE_TEST_ENVIRONMENT_KEYS):

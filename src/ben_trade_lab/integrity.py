@@ -24,6 +24,7 @@ HASHED_DOCS = (
     "docs/RESEARCH_CONTRACT.md",
     "docs/DATA_PROVENANCE.md",
     "docs/DATA_ANOMALIES.md",
+    "docs/APPEND_ONLY_WITNESS.md",
 )
 HASHED_DATA_FILES = (
     "data/manifests/BTCUSDT-1h-1502942400000-1785542400000-afaef07eb47c4613-cc3f4f474f84a96f.json",

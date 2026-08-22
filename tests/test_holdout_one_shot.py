@@ -4,6 +4,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -37,6 +38,13 @@ from ben_trade_lab.validation import (
     _write_state_exclusive,
     finalize_holdout,
 )
+from ben_trade_lab.witness import (
+    FS_APPEND_FL,
+    GENESIS_RECORD_SHA256,
+    WITNESS_LEDGER_TYPE,
+    WITNESS_POLICY,
+    WITNESS_SCHEMA_VERSION,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 HOUR_MS = 3_600_000
@@ -66,23 +74,41 @@ def _serialized_bar(open_time_ms: int) -> dict[str, object]:
 
 
 def _metric(total_return: float = 0.10) -> dict[str, object]:
+    terminal_equity = 10_000.0 * (1.0 + total_return)
+    elapsed_hours = 2.0
+    elapsed_years = max(elapsed_hours / (365.25 * 24.0), 1.0 / 365.25)
+    cagr = (terminal_equity / 10_000.0) ** (1.0 / elapsed_years) - 1.0
     return {
         "initial_cash": 10_000.0,
-        "terminal_equity": 10_000.0 * (1.0 + total_return),
+        "terminal_equity": terminal_equity,
+        "mark_to_market_terminal_equity": terminal_equity,
+        "mark_to_market_total_return": total_return,
+        "terminal_liquidation_applied": False,
+        "terminal_liquidation_executable": True,
+        "terminal_state_eligible": True,
+        "terminal_liquidation_value": terminal_equity,
+        "terminal_liquidation_cost": 0.0,
+        "terminal_liquidation_slippage_cost": 0.0,
+        "terminal_liquidation_fee": 0.0,
+        "terminal_liquidation_reference_price": 100.0,
+        "terminal_liquidation_execution_price": 100.0,
+        "terminal_open_quantity": 0.0,
         "total_return": total_return,
-        "cagr": 0.10,
+        "cagr": cagr,
         "annualized_sharpe_daily": 1.25,
         "annualized_sortino_daily": 1.50,
         "maximum_drawdown": -0.10,
-        "calmar": 1.0,
+        "calmar": cagr / 0.10,
         "completed_round_trips": 40,
         "fill_count": 80,
         "exposure_fraction": 0.40,
         "total_fees": 10.0,
+        "performance_total_fees_including_terminal_liquidation": 10.0,
         "maximum_positive_quarter_mark_to_market_profit_concentration": 0.40,
         "start_open_time_ms": 0,
         "end_open_time_ms": HOUR_MS,
         "equity_points": 2,
+        "elapsed_hours": elapsed_hours,
     }
 
 
@@ -108,6 +134,36 @@ class HoldoutOneShotTests(unittest.TestCase):
         # downstream artifact to that exact descriptor rather than the real
         # release anchor configured for production.
         config.raw["anchor"]["store_sha256"] = anchor_store.store_sha256
+        witness_root = sandbox / "append-only-witness"
+        witness_root.mkdir()
+        witness_ledger = witness_root / "holdout-witness.jsonl"
+        witness_ledger.touch()
+        witness_metadata = witness_ledger.stat()
+        witness_store_id = "9" * 64
+        witness_header: dict[str, object] = {
+            "schema_version": WITNESS_SCHEMA_VERSION,
+            "type": WITNESS_LEDGER_TYPE,
+            "store_id": witness_store_id,
+            "created_at_utc": "2026-08-21T00:00:00.000000Z",
+            "policy": WITNESS_POLICY,
+            "filesystem_device": int(witness_metadata.st_dev),
+            "filesystem_inode": int(witness_metadata.st_ino),
+            "sequence": 0,
+            "previous_record_sha256": GENESIS_RECORD_SHA256,
+            "authority": "RESEARCH_ONLY_ZERO_LIVE_AUTHORITY",
+            "capability": "LIVE_DISABLED",
+        }
+        witness_header["record_sha256"] = hashlib.sha256(
+            canonical_json(witness_header)
+        ).hexdigest()
+        witness_ledger.write_bytes(canonical_json(witness_header) + b"\n")
+        config.raw["witness"] = {
+            "store_id": witness_store_id,
+            "header_sha256": witness_header["record_sha256"],
+            "filesystem_device": int(witness_metadata.st_dev),
+            "filesystem_inode": int(witness_metadata.st_ino),
+            "policy": WITNESS_POLICY,
+        }
         grid = config.strategy_grid()
         selected = next(
             params
@@ -137,7 +193,7 @@ class HoldoutOneShotTests(unittest.TestCase):
             method_version=VALIDATION_METHOD,
             config_sha256=config.config_sha256,
             source_tree_sha256_value=source_sha,
-            lockbox_id="LOCKBOX_TEST_ONLY",
+            lockbox_id="8" * 64,
             preholdout_data_sha256=preholdout_sha,
             holdout_commitment_sha256=holdout_sha,
             selected_params=selected_value,
@@ -158,7 +214,7 @@ class HoldoutOneShotTests(unittest.TestCase):
             "locked_partition_descriptor_sha256": locked_descriptor_sha,
             "config_sha256": config.config_sha256,
             "source_tree_sha256": source_sha,
-            "lockbox_id": "LOCKBOX_TEST_ONLY",
+            "lockbox_id": "8" * 64,
             "preholdout_data_sha256": preholdout_sha,
             "holdout_commitment_sha256": holdout_sha,
             "parent_manifest_sha256": parent_sha,
@@ -285,13 +341,16 @@ class HoldoutOneShotTests(unittest.TestCase):
         )
 
         metadata: dict[str, object] = {
+            "kind": "LOCKED_HOLDOUT",
             "manifest_path": locked_manifest_path,
             "manifest_file_sha256": locked_manifest_sha,
+            "config_sha256": config.config_sha256,
             "partition_descriptor_sha256": locked_descriptor_sha,
             "paired_partition_kind": "PREHOLDOUT",
             "paired_partition_descriptor_sha256": preholdout_descriptor_sha,
-            "lockbox_id": "LOCKBOX_TEST_ONLY",
+            "lockbox_id": "8" * 64,
             "normalized_sha256": holdout_sha,
+            "holdout_commitment_sha256": holdout_sha,
             "preholdout_sha256": preholdout_sha,
             "parent_manifest_sha256": parent_sha,
             "declared_source_anomalies": [],
@@ -315,6 +374,8 @@ class HoldoutOneShotTests(unittest.TestCase):
             anchor_root=anchor_root,
             anchor_store_id=anchor_store_id,
             anchor_store=anchor_store,
+            witness_ledger=witness_ledger,
+            witness_store_id=witness_store_id,
             config=config,
             selected=selected_value,
             neighbors=neighbors,
@@ -344,6 +405,23 @@ class HoldoutOneShotTests(unittest.TestCase):
         load_value = (harness.holdout_bars, supplied_metadata)
         metric_effect = metric_side_effect if metric_side_effect is not None else _metric()
         with (
+            patch(
+                "ben_trade_lab.witness._require_supported_platform",
+                return_value=None,
+            ),
+            patch(
+                "ben_trade_lab.witness._read_inode_flags",
+                return_value=FS_APPEND_FL,
+            ),
+            patch(
+                "ben_trade_lab.witness._shared_lock",
+                side_effect=lambda _descriptor: nullcontext(),
+            ),
+            patch(
+                "ben_trade_lab.witness._exclusive_lock",
+                side_effect=lambda _descriptor: nullcontext(),
+            ),
+            patch("ben_trade_lab.witness.fsync_directory"),
             patch(
                 "ben_trade_lab.validation.read_manifest_metadata",
                 return_value=supplied_metadata,
@@ -377,6 +455,8 @@ class HoldoutOneShotTests(unittest.TestCase):
                     if anchor_store_id is None
                     else anchor_store_id
                 ),
+                witness_ledger=harness.witness_ledger,
+                witness_store_id=harness.witness_store_id,
                 root=harness.root,
             )
         return result, load_mock, metric_mock
@@ -437,7 +517,7 @@ class HoldoutOneShotTests(unittest.TestCase):
             self.assertEqual(calls[-1][0], "benchmark")
 
             report = verified_hashed_object(report_path, "report_sha256")
-            self.assertEqual(report["schema_version"], "1.2.0")
+            self.assertEqual(report["schema_version"], "1.3.0")
             self.assertEqual(report["report_kind"], REPORT_KIND_LOCKED_OOS_EVALUATION)
             self.assertEqual(report["evidence_level"], "RETROSPECTIVE_LOCKED_OOS")
             self.assertEqual(report["benchmark_protocol"], BENCHMARK_PROTOCOL)
@@ -615,7 +695,7 @@ class HoldoutOneShotTests(unittest.TestCase):
             retry_load = Mock(return_value=(harness.holdout_bars, harness.metadata))
             with self.assertRaisesRegex(
                 RuntimeError,
-                "EXTERNAL_HOLDOUT_OPENED_WITHOUT_LOCAL_STATE_NOT_RETRYABLE",
+                "WITNESS_HOLDOUT_OPENED_WITHOUT_LOCAL_STATE_NOT_RETRYABLE",
             ):
                 self._call(harness, load_side_effect=retry_load)
             retry_load.assert_not_called()
@@ -629,30 +709,12 @@ class HoldoutOneShotTests(unittest.TestCase):
                     record.parent.mkdir(parents=True)
                     record.write_bytes(b'{"partial":')
                 else:
-                    frozen = verified_hashed_object(harness.frozen_path, "state_sha256")
-                    test_receipt = verified_hashed_object(
-                        harness.test_receipt_path,
-                        "receipt_sha256",
-                    )
-                    review_receipt = verified_hashed_object(
-                        harness.review_receipt_path,
-                        "receipt_sha256",
-                    )
-                    _write_state_exclusive(
-                        harness.opened_path,
-                        {
-                            "state": "HOLDOUT_OPENED",
-                            "experiment_id": harness.experiment_id,
-                            "previous_state_sha256": frozen["state_sha256"],
-                            "selection_sha256": test_receipt["selection_sha256"],
-                            "holdout_manifest_sha256": "d" * 64,
-                            "test_receipt_sha256": test_receipt["receipt_sha256"],
-                            "review_receipt_sha256": review_receipt["receipt_sha256"],
-                            "opened_at_utc": "2026-08-21T00:01:00.000000Z",
-                            "external_anchor_store_id": harness.anchor_store_id,
-                            "external_anchor_sha256": "f" * 64,
-                        },
-                    )
+                    with self.assertRaisesRegex(RuntimeError, "stop after opening"):
+                        self._call(
+                            harness,
+                            load_side_effect=RuntimeError("stop after opening"),
+                        )
+                    harness.anchor_store.record_path(harness.experiment_id).unlink()
 
                 load_mock = Mock(return_value=(harness.holdout_bars, harness.metadata))
                 expected = ExternalAnchorCorruption if case == "partial_external" else RuntimeError
@@ -761,6 +823,49 @@ class HoldoutOneShotTests(unittest.TestCase):
                     )
                 self.assertFalse(harness.opened_path.exists())
                 load_mock.assert_not_called()
+
+    def test_post_open_manifest_swap_consumes_open_without_running_metrics(self) -> None:
+        for field, replacement in (
+            ("manifest_file_sha256", "e" * 64),
+            ("normalized_sha256", "e" * 64),
+            ("declared_source_anomalies", [{"type": "POST_OPEN_SWAP"}]),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                harness = self._build_harness(Path(temporary))
+                postopen = dict(harness.metadata)
+                postopen[field] = replacement
+                calls = {"load": 0, "metric": 0}
+
+                def swapped_load(
+                    *_args: object,
+                    call_counts: dict[str, int] = calls,
+                    bars: object = harness.holdout_bars,
+                    manifest: object = postopen,
+                    **_kwargs: object,
+                ) -> object:
+                    call_counts["load"] += 1
+                    return bars, manifest
+
+                def metric_probe(
+                    *_args: object,
+                    call_counts: dict[str, int] = calls,
+                    **_kwargs: object,
+                ) -> object:
+                    call_counts["metric"] += 1
+                    return _metric()
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "post-open holdout manifest differs from pre-open metadata",
+                ):
+                    self._call(
+                        harness,
+                        load_side_effect=swapped_load,
+                        metric_side_effect=metric_probe,
+                    )
+                self.assertTrue(harness.opened_path.exists())
+                self.assertFalse(harness.finalized_path.exists())
+                self.assertEqual(calls, {"load": 1, "metric": 0})
 
     def test_skipped_full_provenance_replay_cannot_open_or_load_holdout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -996,7 +1101,10 @@ class HoldoutOneShotTests(unittest.TestCase):
             self.assertFalse(harness.finalized_path.exists())
 
             retry_load = Mock(return_value=(harness.holdout_bars, harness.metadata))
-            with self.assertRaisesRegex(RuntimeError, "HOLDOUT_ALREADY_OPENED_NOT_RETRYABLE"):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "WITNESS_FINALIZED_WITHOUT_LOCAL_FINALIZED_NOT_RETRYABLE",
+            ):
                 self._call(harness, load_side_effect=retry_load)
             retry_load.assert_not_called()
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
 import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,6 +20,15 @@ CANONICAL_ANCHOR_STORE_SHA256 = (
     "0f12006fa9f7d5137faa77f694b59bce4afe34899f93ca9785d1ab923ab1a995"
 )
 CANONICAL_ANCHOR_POLICY = "CREATE_ONLY_PER_EXPERIMENT_HASH_CHAIN_V1"
+CANONICAL_WITNESS_STORE_ID = (
+    "3e19a9e67f76ed22f2345d202f607d006ac512f24f7ff96e85822133870dcca9"
+)
+CANONICAL_WITNESS_HEADER_SHA256 = (
+    "b28626b92481c06f86f6757113f89b123f2eac170ab0387f70567e2f67a0da2c"
+)
+CANONICAL_WITNESS_FILESYSTEM_DEVICE = 2096
+CANONICAL_WITNESS_FILESYSTEM_INODE = 2434
+CANONICAL_WITNESS_POLICY = "LINUX_FS_APPEND_FL_ONE_SHOT_BURN_LEDGER_V1"
 
 
 def parse_utc_ms(value: str) -> int:
@@ -36,6 +46,21 @@ def canonical_json(value: Any) -> bytes:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _strict_frozen_equal(actual: object, expected: object) -> bool:
+    """Compare frozen config values without Python's bool/int coercions."""
+
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, float) and isinstance(actual, float):
+        return math.isfinite(actual) and actual == expected
+    if isinstance(expected, list) and isinstance(actual, list):
+        return len(actual) == len(expected) and all(
+            _strict_frozen_equal(left, right)
+            for left, right in zip(actual, expected, strict=True)
+        )
+    return actual == expected
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +87,10 @@ class LabConfig:
     @property
     def anchor(self) -> dict[str, Any]:
         return self.raw["anchor"]
+
+    @property
+    def witness(self) -> dict[str, Any]:
+        return self.raw["witness"]
 
     @property
     def config_sha256(self) -> str:
@@ -121,6 +150,7 @@ def _validate(raw: dict[str, Any]) -> None:
         "acceptance",
         "diagnostics",
         "anchor",
+        "witness",
         "paper",
     }
     missing = required.difference(raw)
@@ -158,11 +188,14 @@ def _validate(raw: dict[str, Any]) -> None:
         "maximum_gross_exposure": 1.0,
         "signal_fill_delay_bars": 1,
     }
-    if any(float(execution.get(key, -1.0)) != value for key, value in exact_execution.items()):
+    if any(
+        not _strict_frozen_equal(execution.get(key), value)
+        for key, value in exact_execution.items()
+    ):
         raise ValueError("v1.2 cash, cost, exposure, and base-latency assumptions are frozen")
     if execution.get("allow_short") is not False or execution.get("allow_leverage") is not False:
         raise ValueError("shorting and leverage must remain disabled")
-    if int(execution.get("signal_fill_delay_bars", 0)) < 1:
+    if execution.get("signal_fill_delay_bars") < 1:
         raise ValueError("signals must fill at least one bar later")
     if (
         execution.get("fill_eligibility")
@@ -179,7 +212,7 @@ def _validate(raw: dict[str, Any]) -> None:
         != "LIQUIDATE_AT_FINAL_ELIGIBLE_CLOSE_WITH_COSTS_ELSE_NOT_PROVEN"
     ):
         raise ValueError("terminal valuation must fail closed when liquidation is ineligible")
-    exposure = float(execution.get("maximum_gross_exposure", 0.0))
+    exposure = execution["maximum_gross_exposure"]
     if not 0.0 < exposure <= 1.0:
         raise ValueError("gross exposure must be within (0, 1]")
     start = parse_utc_ms(market["start_utc"])
@@ -205,28 +238,35 @@ def _validate(raw: dict[str, Any]) -> None:
         "target_annualized_volatility": 0.30,
         "volatility_floor": 0.10,
     }
-    if any(strategy.get(key) != value for key, value in exact_strategy.items()):
+    if any(
+        not _strict_frozen_equal(strategy.get(key), value)
+        for key, value in exact_strategy.items()
+    ):
         raise ValueError("v1.2 strategy family and parameter grid are frozen")
     selection = raw["selection"]
     if selection.get("objective") != "MEDIAN_WALK_FORWARD_CALMAR":
         raise ValueError("v1.2 uses the frozen median walk-forward Calmar objective")
-    if int(selection.get("maximum_trials", 0)) != 16:
+    if not _strict_frozen_equal(selection.get("maximum_trials"), 16):
         raise ValueError("v1.2 trial budget is exactly 16 candidates")
-    if int(selection.get("expected_fold_count", 0)) != 9:
+    if not _strict_frozen_equal(selection.get("expected_fold_count"), 9):
         raise ValueError("v1.2 requires exactly nine scoring folds")
     scoring_start = parse_utc_ms(selection["scoring_start_utc"])
     if scoring_start != parse_utc_ms("2020-02-01T00:00:00Z"):
         raise ValueError("v1.2 scoring start is frozen at 2020-02-01 UTC")
-    if int(selection.get("minimum_fold_months", 0)) != 6:
+    if not _strict_frozen_equal(selection.get("minimum_fold_months"), 6):
         raise ValueError("v1.2 uses exact six-month folds")
-    if int(selection.get("minimum_fold_completed_round_trips", -1)) != 2:
+    if not _strict_frozen_equal(
+        selection.get("minimum_fold_completed_round_trips"), 2
+    ):
         raise ValueError("v1.2 fold round-trip floor is frozen at two")
-    minimum_exposure = float(selection.get("minimum_fold_exposure_fraction", -1.0))
-    maximum_exposure = float(selection.get("maximum_fold_exposure_fraction", -1.0))
-    if minimum_exposure != 0.05 or maximum_exposure != 0.95:
+    minimum_exposure = selection.get("minimum_fold_exposure_fraction")
+    maximum_exposure = selection.get("maximum_fold_exposure_fraction")
+    if not _strict_frozen_equal(minimum_exposure, 0.05) or not _strict_frozen_equal(
+        maximum_exposure, 0.95
+    ):
         raise ValueError("v1.2 fold exposure bounds are frozen")
-    positive_fraction = float(selection.get("minimum_positive_fold_fraction", -1.0))
-    if positive_fraction != 0.75:
+    positive_fraction = selection.get("minimum_positive_fold_fraction")
+    if not _strict_frozen_equal(positive_fraction, 0.75):
         raise ValueError("v1.2 positive-fold threshold is frozen")
     acceptance = raw["acceptance"]
     exact_acceptance = {
@@ -238,14 +278,19 @@ def _validate(raw: dict[str, Any]) -> None:
         "minimum_positive_parameter_neighbors_fraction": 0.70,
         "maximum_single_quarter_profit_concentration": 0.50,
     }
-    if any(float(acceptance.get(key, -1.0)) != value for key, value in exact_acceptance.items()):
+    if any(
+        not _strict_frozen_equal(acceptance.get(key), value)
+        for key, value in exact_acceptance.items()
+    ):
         raise ValueError("v1.2 acceptance gates are frozen")
     diagnostics = raw["diagnostics"]
-    if int(diagnostics.get("moving_block_bootstrap_resamples", 0)) != 2000:
+    if not _strict_frozen_equal(
+        diagnostics.get("moving_block_bootstrap_resamples"), 2000
+    ):
         raise ValueError("v1.2 bootstrap resample count is frozen at 2000")
-    if int(diagnostics.get("moving_block_length_days", 0)) != 7:
+    if not _strict_frozen_equal(diagnostics.get("moving_block_length_days"), 7):
         raise ValueError("v1.2 moving-block length is frozen at seven days")
-    if int(diagnostics.get("latency_stress_delay_bars", 0)) != 2:
+    if not _strict_frozen_equal(diagnostics.get("latency_stress_delay_bars"), 2):
         raise ValueError("v1.2 latency stress is frozen at two bars")
     if diagnostics.get("seed_policy") != "SHA256_EXPERIMENT_ID":
         raise ValueError("diagnostic seed policy mismatch")
@@ -256,11 +301,43 @@ def _validate(raw: dict[str, Any]) -> None:
         raise ValueError("v1.2 external anchor store descriptor is frozen")
     if anchor.get("policy") != CANONICAL_ANCHOR_POLICY:
         raise ValueError("v1.2 external anchor policy is frozen")
+    witness = raw["witness"]
+    if not isinstance(witness, dict) or set(witness) != {
+        "store_id",
+        "header_sha256",
+        "filesystem_device",
+        "filesystem_inode",
+        "policy",
+    }:
+        raise ValueError("v1.2 append-only witness schema is frozen")
+    if witness.get("store_id") != CANONICAL_WITNESS_STORE_ID:
+        raise ValueError("v1.2 append-only witness store identity is frozen")
+    if witness.get("header_sha256") != CANONICAL_WITNESS_HEADER_SHA256:
+        raise ValueError("v1.2 append-only witness header is frozen")
+    device = witness.get("filesystem_device")
+    if (
+        not isinstance(device, int)
+        or isinstance(device, bool)
+        or device != CANONICAL_WITNESS_FILESYSTEM_DEVICE
+    ):
+        raise ValueError("v1.2 append-only witness filesystem device is frozen")
+    inode = witness.get("filesystem_inode")
+    if (
+        not isinstance(inode, int)
+        or isinstance(inode, bool)
+        or inode != CANONICAL_WITNESS_FILESYSTEM_INODE
+    ):
+        raise ValueError("v1.2 append-only witness inode is frozen")
+    if witness.get("policy") != CANONICAL_WITNESS_POLICY:
+        raise ValueError("v1.2 append-only witness policy is frozen")
     paper = raw["paper"]
     exact_paper = {
         "minimum_calendar_days": 180,
         "minimum_completed_round_trips": 30,
         "maximum_tracking_error_bps": 10.0,
     }
-    if any(float(paper.get(key, -1.0)) != value for key, value in exact_paper.items()):
+    if any(
+        not _strict_frozen_equal(paper.get(key), value)
+        for key, value in exact_paper.items()
+    ):
         raise ValueError("v1.2 paper-validation gates are frozen")

@@ -15,6 +15,8 @@ import ben_trade_lab.anchor as anchor_module
 from ben_trade_lab.anchor import (
     ANCHOR_FIELDS,
     ANCHOR_RECORD_NAME,
+    ANCHOR_RECORD_SCHEMA_VERSION,
+    OPENED_STATE_BASE_FIELDS,
     STORE_FIELDS,
     ExternalAnchorAlreadyInitialized,
     ExternalAnchorAlreadyOpened,
@@ -53,22 +55,42 @@ class ExternalAnchorStoreTests(unittest.TestCase):
             created_at_utc=self.CREATED_AT,
         )
 
-    def _opened_base(self) -> dict[str, object]:
+    def _opened_base(self, store) -> dict[str, object]:
         return {
             "state": "HOLDOUT_OPENED",
             "experiment_id": self.EXPERIMENT_ID,
             "previous_state_sha256": "1" * 64,
             "selection_sha256": "2" * 64,
+            "config_sha256": "6" * 64,
+            "source_tree_sha256": "7" * 64,
+            "preholdout_manifest_sha256": "a" * 64,
+            "preholdout_partition_descriptor_sha256": "b" * 64,
+            "locked_partition_descriptor_sha256": "c" * 64,
+            "parent_manifest_sha256": "d" * 64,
+            "lockbox_id": "LOCKBOX-TEST-V1",
+            "preholdout_data_sha256": "8" * 64,
+            "holdout_commitment_sha256": "9" * 64,
             "holdout_manifest_sha256": "3" * 64,
             "test_receipt_sha256": "4" * 64,
             "review_receipt_sha256": "5" * 64,
             "opened_at_utc": self.OPENED_AT,
+            "opening_commitment_sha256": "f" * 64,
+            "external_anchor_store_id": store.store_id,
+            "external_anchor_store_sha256": store.store_sha256,
+            "witness_policy": "LINUX_FS_APPEND_FL_ONE_SHOT_BURN_LEDGER_V1",
+            "witness_store_id": "0" * 64,
+            "witness_header_sha256": "e" * 64,
+            "witness_filesystem_device": 2049,
+            "witness_filesystem_inode": 424242,
+            "witness_burn_sequence": 1,
+            "witness_burn_sha256": "b" * 64,
+            "witness_burned_at_utc": self.OPENED_AT,
         }
 
     def _commit(self, store):
         return commit_holdout_opened_anchor(
             store,
-            opened_state_base=self._opened_base(),
+            opened_state_base=self._opened_base(store),
             config_sha256="6" * 64,
             source_tree_sha256="7" * 64,
             preholdout_data_sha256="8" * 64,
@@ -212,6 +234,8 @@ class ExternalAnchorStoreTests(unittest.TestCase):
 
         self.assertEqual(record_path.name, ANCHOR_RECORD_NAME)
         self.assertEqual(set(anchor), ANCHOR_FIELDS)
+        self.assertEqual(anchor["schema_version"], ANCHOR_RECORD_SCHEMA_VERSION)
+        self.assertEqual(ANCHOR_RECORD_SCHEMA_VERSION, "1.1.0")
         self.assertEqual(payload, canonical_json(anchor) + b"\n")
         unsigned = {key: value for key, value in anchor.items() if key != "anchor_sha256"}
         self.assertEqual(
@@ -220,11 +244,79 @@ class ExternalAnchorStoreTests(unittest.TestCase):
         )
         self.assertEqual(
             anchor["opened_state_base_sha256"],
-            hashlib.sha256(canonical_json(self._opened_base())).hexdigest(),
+            hashlib.sha256(canonical_json(self._opened_base(store))).hexdigest(),
         )
+        opened = self._opened_base(store)
+        self.assertEqual(set(opened), OPENED_STATE_BASE_FIELDS)
+        for field in (
+            "opening_commitment_sha256",
+            "witness_policy",
+            "witness_store_id",
+            "witness_header_sha256",
+            "witness_filesystem_device",
+            "witness_filesystem_inode",
+            "witness_burn_sequence",
+            "witness_burn_sha256",
+            "witness_burned_at_utc",
+        ):
+            self.assertEqual(anchor[field], opened[field])
         self.assertEqual(read_holdout_opened_anchor(store, self.EXPERIMENT_ID), anchor)
         with self.assertRaisesRegex(ExternalAnchorAlreadyOpened, "NOT_RETRYABLE"):
             self._commit(store)
+
+    def test_opening_and_witness_tampering_is_rejected_after_rehash(self) -> None:
+        store = self._initialize()
+        committed = self._commit(store)
+        record = store.record_path(self.EXPERIMENT_ID)
+        original = record.read_bytes()
+        cases = (
+            (
+                "opening_commitment_sha256",
+                "not-a-sha256",
+                "EXTERNAL_ANCHOR_OPENING_COMMITMENT_SHA256_MALFORMED",
+            ),
+            (
+                "witness_burn_sha256",
+                "not-a-sha256",
+                "EXTERNAL_ANCHOR_WITNESS_BURN_SHA256_MALFORMED",
+            ),
+            (
+                "witness_burn_sequence",
+                0,
+                "EXTERNAL_ANCHOR_WITNESS_BURN_SEQUENCE_INVALID",
+            ),
+            (
+                "witness_burned_at_utc",
+                self.CREATED_AT,
+                "EXTERNAL_ANCHOR_TIMESTAMPS_MISMATCH",
+            ),
+        )
+
+        for field, value, expected_error in cases:
+            with self.subTest(field=field):
+                tampered = dict(committed)
+                tampered[field] = value
+                unsigned = {
+                    key: item
+                    for key, item in tampered.items()
+                    if key != "anchor_sha256"
+                }
+                tampered["anchor_sha256"] = hashlib.sha256(
+                    canonical_json(unsigned)
+                ).hexdigest()
+                record.write_bytes(canonical_json(tampered) + b"\n")
+                try:
+                    with self.assertRaisesRegex(
+                        ExternalAnchorCorruption, expected_error
+                    ):
+                        verify_anchor_store(
+                            self.anchor_root,
+                            repository_root=self.repository,
+                            expected_store_id=self.STORE_ID,
+                            expected_store_sha256=store.store_sha256,
+                        )
+                finally:
+                    record.write_bytes(original)
 
     def test_partial_or_tampered_record_never_gets_overwritten_or_retried(self) -> None:
         store = self._initialize()
@@ -245,7 +337,7 @@ class ExternalAnchorStoreTests(unittest.TestCase):
             created_at_utc=self.CREATED_AT,
         )
         other_id = "f" * 64
-        opened = self._opened_base()
+        opened = self._opened_base(tamper_store)
         opened["experiment_id"] = other_id
         committed = commit_holdout_opened_anchor(
             tamper_store,
@@ -265,6 +357,52 @@ class ExternalAnchorStoreTests(unittest.TestCase):
                 repository_root=self.repository,
                 expected_store_id="b" * 64,
                 expected_store_sha256=tamper_store.store_sha256,
+            )
+
+    def test_anchor_primitive_rejects_mismatched_opened_base_bindings(self) -> None:
+        store = self._initialize()
+        cases = {
+            "external_anchor_store_id": "f" * 64,
+            "external_anchor_store_sha256": "f" * 64,
+            "config_sha256": "f" * 64,
+            "source_tree_sha256": "f" * 64,
+            "preholdout_data_sha256": "f" * 64,
+            "holdout_commitment_sha256": "f" * 64,
+        }
+        for field, replacement in cases.items():
+            with self.subTest(field=field):
+                opened = self._opened_base(store)
+                opened[field] = replacement
+                with self.assertRaisesRegex(ValueError, field.upper()):
+                    commit_holdout_opened_anchor(
+                        store,
+                        opened_state_base=opened,
+                        config_sha256="6" * 64,
+                        source_tree_sha256="7" * 64,
+                        preholdout_data_sha256="8" * 64,
+                        holdout_commitment_sha256="9" * 64,
+                    )
+                self.assertFalse(store.record_path(self.EXPERIMENT_ID).exists())
+
+    def test_rehashed_record_cannot_claim_another_store_descriptor(self) -> None:
+        store = self._initialize()
+        self._commit(store)
+        record = store.record_path(self.EXPERIMENT_ID)
+        value = json.loads(record.read_text(encoding="utf-8"))
+        value.pop("anchor_sha256")
+        value["anchor_store_sha256"] = "f" * 64
+        value["anchor_sha256"] = hashlib.sha256(canonical_json(value)).hexdigest()
+        record.write_bytes(canonical_json(value) + b"\n")
+
+        with self.assertRaisesRegex(
+            ExternalAnchorCorruption,
+            "STORE_SHA256_MISMATCH",
+        ):
+            verify_anchor_store(
+                self.anchor_root,
+                repository_root=self.repository,
+                expected_store_id=store.store_id,
+                expected_store_sha256=store.store_sha256,
             )
 
     def test_commit_flushes_file_and_every_directory_level(self) -> None:
